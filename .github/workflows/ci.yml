@@ -13,6 +13,20 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
 
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: synap
+          POSTGRES_DB: synap
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,7 +38,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,fastapi,sanic]"
+          pip install -e ".[dev,postgres,fastapi,sanic]"
 
       - name: Run tests
+        env:
+          SYNAP_TEST_POSTGRES_DSN: postgresql://postgres:synap@localhost:5432/synap
         run: pytest
