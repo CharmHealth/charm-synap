@@ -13,6 +13,24 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _coerce_timestamp(value: Any) -> datetime:
+    """Coerce a caller-supplied timestamp into a datetime asyncpg can encode.
+
+    Synap's higher layers serialize timestamps as ISO strings so they round-trip
+    through any backend, but asyncpg's timestamptz encoder requires a datetime
+    instance regardless of the ``::timestamptz`` cast on the bind. This adapter
+    accepts a datetime, an ISO 8601 string, or ``None`` (now)."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        # fromisoformat handles "+00:00" and naive ISO strings; assume UTC if naive.
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    return datetime.now(timezone.utc)
+
+
 _SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -108,8 +126,8 @@ class PostgresBackend:
                 embedding_str,
                 float(node.get("utility_score", 1.0)),
                 int(node.get("access_count", 0)),
-                node.get("created_at", _now_iso()),
-                node.get("last_accessed", _now_iso()),
+                _coerce_timestamp(node.get("created_at")),
+                _coerce_timestamp(node.get("last_accessed")),
                 json.dumps(node.get("metadata", {})),
             )
 
@@ -147,7 +165,7 @@ class PostgresBackend:
                 edge["target_id"],
                 edge["relation_type"],
                 float(edge.get("weight", 1.0)),
-                edge.get("created_at", _now_iso()),
+                _coerce_timestamp(edge.get("created_at")),
                 json.dumps(edge.get("metadata", {})),
             )
 
