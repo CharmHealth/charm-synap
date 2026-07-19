@@ -242,31 +242,35 @@ class KuzuBackend:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         conn = self._conn()
+
+        where = ""
+        params: dict[str, Any] = {}
         if node_type:
-            result = conn.execute(
-                """
-                MATCH (n:MemoryNode)
-                WHERE n.node_type = $ntype
-                RETURN n.id, n.node_type, n.content, n.embedding,
-                       n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata
-                ORDER BY n.utility_score DESC
-                LIMIT $lim
-                """,
-                parameters={"ntype": node_type, "lim": limit},
-            )
+            where = "WHERE n.node_type = $ntype"
+            params["ntype"] = node_type
+
+        # Metadata filters are applied in Python after rows materialize. When
+        # they are present the LIMIT must apply *after* filtering (parity with
+        # the Postgres pushdown), so we fetch the ordered candidate set here and
+        # truncate below rather than letting Cypher limit pre-filter rows.
+        if filters:
+            limit_clause = ""
         else:
-            result = conn.execute(
-                """
-                MATCH (n:MemoryNode)
-                RETURN n.id, n.node_type, n.content, n.embedding,
-                       n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata
-                ORDER BY n.utility_score DESC
-                LIMIT $lim
-                """,
-                parameters={"lim": limit},
-            )
+            limit_clause = "LIMIT $lim"
+            params["lim"] = limit
+
+        result = conn.execute(
+            f"""
+            MATCH (n:MemoryNode)
+            {where}
+            RETURN n.id, n.node_type, n.content, n.embedding,
+                   n.utility_score, n.access_count,
+                   n.created_at, n.last_accessed, n.metadata
+            ORDER BY n.utility_score DESC
+            {limit_clause}
+            """,
+            parameters=params,
+        )
 
         nodes = [self._row_to_node(r) for r in self._collect_rows(result)]
 
@@ -278,6 +282,7 @@ class KuzuBackend:
                     for k, v in filters.items()
                 )
             ]
+            nodes = nodes[:limit]
 
         return nodes
 

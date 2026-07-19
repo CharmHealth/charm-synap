@@ -144,8 +144,15 @@ class SQLiteBackend:
             query += " AND node_type = ?"
             params.append(node_type)
 
-        query += " ORDER BY utility_score DESC LIMIT ?"
-        params.append(limit)
+        query += " ORDER BY utility_score DESC"
+
+        # When metadata filters are present the LIMIT must apply *after*
+        # filtering (parity with the Postgres pushdown), so it is enforced in
+        # the Python loop below instead of in SQL. Without filters SQL limits
+        # directly.
+        if not filters:
+            query += " LIMIT ?"
+            params.append(limit)
 
         rows = self._conn.execute(query, params).fetchall()
         results = []
@@ -155,6 +162,8 @@ class SQLiteBackend:
                 meta = json.loads(row["metadata"])
                 if all(meta.get(k) == v for k, v in filters.items()):
                     results.append(data)
+                    if len(results) >= limit:
+                        break
             else:
                 results.append(data)
         return results
