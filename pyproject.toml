@@ -34,7 +34,10 @@ kuzu = ["kuzu>=0.8.0"]
 postgres = ["asyncpg>=0.30.0"]
 mcp = ["fastmcp>=2.0.0"]
 fastapi = ["fastapi>=0.115.0", "pydantic>=2.0", "uvicorn>=0.30.0"]
-sanic = ["sanic>=24.6.0", "pydantic>=2.0"]
+# tracerite 2.6.0 renamed the module-level `style` that sanic reads as
+# `tracerite.html.style` at import time; excluding it avoids the broken combo
+# (2.6.1 restored the alias). sanic itself does not cap tracerite.
+sanic = ["sanic>=24.6.0", "pydantic>=2.0", "tracerite!=2.6.0"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
