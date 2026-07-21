@@ -26,6 +26,8 @@ CREATE NODE TABLE IF NOT EXISTS MemoryNode(
     created_at STRING,
     last_accessed STRING,
     metadata STRING DEFAULT '{{}}',
+    valid_from STRING,
+    valid_until STRING,
     PRIMARY KEY(id)
 );
 
@@ -135,7 +137,9 @@ class KuzuBackend:
                     n.access_count = $access_count,
                     n.created_at = $created_at,
                     n.last_accessed = $last_accessed,
-                    n.metadata = $metadata
+                    n.metadata = $metadata,
+                    n.valid_from = $valid_from,
+                    n.valid_until = $valid_until
                 ON MATCH SET
                     n.node_type = $node_type,
                     n.content = $content,
@@ -143,7 +147,9 @@ class KuzuBackend:
                     n.utility_score = $utility_score,
                     n.access_count = $access_count,
                     n.last_accessed = $last_accessed,
-                    n.metadata = $metadata
+                    n.metadata = $metadata,
+                    n.valid_from = $valid_from,
+                    n.valid_until = $valid_until
                 """,
                 parameters={
                     "id": node["id"],
@@ -155,6 +161,8 @@ class KuzuBackend:
                     "created_at": node.get("created_at", _now_iso()),
                     "last_accessed": node.get("last_accessed", _now_iso()),
                     "metadata": json.dumps(node.get("metadata", {})),
+                    "valid_from": node.get("valid_from"),
+                    "valid_until": node.get("valid_until"),
                 },
             )
 
@@ -174,7 +182,9 @@ class KuzuBackend:
                 n.access_count = $access_count,
                 n.created_at = $created_at,
                 n.last_accessed = $last_accessed,
-                n.metadata = $metadata
+                n.metadata = $metadata,
+                n.valid_from = $valid_from,
+                n.valid_until = $valid_until
             ON MATCH SET
                 n.node_type = $node_type,
                 n.content = $content,
@@ -182,7 +192,9 @@ class KuzuBackend:
                 n.utility_score = $utility_score,
                 n.access_count = $access_count,
                 n.last_accessed = $last_accessed,
-                n.metadata = $metadata
+                n.metadata = $metadata,
+                n.valid_from = $valid_from,
+                n.valid_until = $valid_until
             """,
             parameters={
                 "id": node["id"],
@@ -194,6 +206,8 @@ class KuzuBackend:
                 "created_at": node.get("created_at", _now_iso()),
                 "last_accessed": node.get("last_accessed", _now_iso()),
                 "metadata": json.dumps(node.get("metadata", {})),
+                "valid_from": node.get("valid_from"),
+                "valid_until": node.get("valid_until"),
             },
         )
 
@@ -203,7 +217,8 @@ class KuzuBackend:
             MATCH (n:MemoryNode {id: $id})
             RETURN n.id, n.node_type, n.content, n.embedding,
                    n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata
+                   n.created_at, n.last_accessed, n.metadata,
+                   n.valid_from, n.valid_until
             """,
             parameters={"id": node_id},
         )
@@ -296,7 +311,8 @@ class KuzuBackend:
             {where}
             RETURN n.id, n.node_type, n.content, n.embedding,
                    n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata
+                   n.created_at, n.last_accessed, n.metadata,
+                   n.valid_from, n.valid_until
             ORDER BY n.utility_score DESC
             {limit_clause}
             """,
@@ -457,7 +473,8 @@ class KuzuBackend:
                 WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
                 RETURN n.id, n.node_type, n.content, n.embedding,
                        n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata, sim
+                       n.created_at, n.last_accessed, n.metadata,
+                       n.valid_from, n.valid_until, sim
                 ORDER BY sim DESC
                 LIMIT $lim
                 """,
@@ -475,7 +492,8 @@ class KuzuBackend:
                 WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
                 RETURN n.id, n.node_type, n.content, n.embedding,
                        n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata, sim
+                       n.created_at, n.last_accessed, n.metadata,
+                       n.valid_from, n.valid_until, sim
                 ORDER BY sim DESC
                 LIMIT $lim
                 """,
@@ -532,7 +550,8 @@ class KuzuBackend:
             WITH DISTINCT neighbor
             RETURN neighbor.id, neighbor.node_type, neighbor.content, neighbor.embedding,
                    neighbor.utility_score, neighbor.access_count,
-                   neighbor.created_at, neighbor.last_accessed, neighbor.metadata
+                   neighbor.created_at, neighbor.last_accessed, neighbor.metadata,
+                   neighbor.valid_from, neighbor.valid_until
             LIMIT $lim
             """,
             parameters=params,
@@ -565,6 +584,8 @@ class KuzuBackend:
             "created_at": row[6],
             "last_accessed": row[7],
             "metadata": json.loads(row[8]) if isinstance(row[8], str) else row[8],
+            "valid_from": row[9] if len(row) > 9 else None,
+            "valid_until": row[10] if len(row) > 10 else None,
         }
 
     def _row_to_edge(self, row: list) -> dict[str, Any]:

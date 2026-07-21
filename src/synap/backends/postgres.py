@@ -31,6 +31,16 @@ def _coerce_timestamp(value: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _coerce_timestamp_optional(value: Any) -> datetime | None:
+    """Like ``_coerce_timestamp`` but preserves ``None``.
+
+    Validity-window fields (``valid_from``/``valid_until``) are nullable — a
+    missing bound must stay NULL rather than defaulting to now()."""
+    if value is None:
+        return None
+    return _coerce_timestamp(value)
+
+
 _SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -43,7 +53,9 @@ CREATE TABLE IF NOT EXISTS {prefix}nodes (
     access_count INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL,
     last_accessed TIMESTAMPTZ NOT NULL,
-    metadata JSONB DEFAULT '{{}}'::jsonb
+    metadata JSONB DEFAULT '{{}}'::jsonb,
+    valid_from TIMESTAMPTZ,
+    valid_until TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_type ON {prefix}nodes(node_type);
@@ -109,8 +121,10 @@ class PostgresBackend:
                 f"""
                 INSERT INTO {self._nodes}
                     (id, node_type, content, embedding, utility_score,
-                     access_count, created_at, last_accessed, metadata)
-                VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb)
+                     access_count, created_at, last_accessed, metadata,
+                     valid_from, valid_until)
+                VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
+                        $10::timestamptz, $11::timestamptz)
                 ON CONFLICT (id) DO UPDATE SET
                     node_type = EXCLUDED.node_type,
                     content = EXCLUDED.content,
@@ -118,7 +132,9 @@ class PostgresBackend:
                     utility_score = EXCLUDED.utility_score,
                     access_count = EXCLUDED.access_count,
                     last_accessed = EXCLUDED.last_accessed,
-                    metadata = EXCLUDED.metadata
+                    metadata = EXCLUDED.metadata,
+                    valid_from = EXCLUDED.valid_from,
+                    valid_until = EXCLUDED.valid_until
                 """,
                 node["id"],
                 node["node_type"],
@@ -129,6 +145,8 @@ class PostgresBackend:
                 _coerce_timestamp(node.get("created_at")),
                 _coerce_timestamp(node.get("last_accessed")),
                 json.dumps(node.get("metadata", {})),
+                _coerce_timestamp_optional(node.get("valid_from")),
+                _coerce_timestamp_optional(node.get("valid_until")),
             )
 
     async def load_node(self, node_id: str) -> dict[str, Any] | None:
@@ -137,7 +155,8 @@ class PostgresBackend:
                 f"""
                 SELECT id, node_type, content, embedding::text,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata
+                       created_at::text, last_accessed::text, metadata,
+                       valid_from::text, valid_until::text
                 FROM {self._nodes} WHERE id = $1
                 """,
                 node_id,
@@ -228,7 +247,8 @@ class PostgresBackend:
                 f"""
                 SELECT id, node_type, content, embedding::text,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata
+                       created_at::text, last_accessed::text, metadata,
+                       valid_from::text, valid_until::text
                 FROM {self._nodes}
                 WHERE {where}
                 ORDER BY utility_score DESC
@@ -293,6 +313,7 @@ class PostgresBackend:
                     SELECT id, node_type, content, embedding::text,
                            utility_score, access_count,
                            created_at::text, last_accessed::text, metadata,
+                           valid_from::text, valid_until::text,
                            1 - (embedding <=> $1::vector) AS similarity
                     FROM {self._nodes}
                     WHERE node_type = $2 AND embedding IS NOT NULL
@@ -307,6 +328,7 @@ class PostgresBackend:
                     SELECT id, node_type, content, embedding::text,
                            utility_score, access_count,
                            created_at::text, last_accessed::text, metadata,
+                           valid_from::text, valid_until::text,
                            1 - (embedding <=> $1::vector) AS similarity
                     FROM {self._nodes}
                     WHERE embedding IS NOT NULL
@@ -368,7 +390,8 @@ class PostgresBackend:
                 SELECT DISTINCT ON (n.id)
                     n.id, n.node_type, n.content, n.embedding::text,
                     n.utility_score, n.access_count,
-                    n.created_at::text, n.last_accessed::text, n.metadata
+                    n.created_at::text, n.last_accessed::text, n.metadata,
+                    n.valid_from::text, n.valid_until::text
                 FROM traversal t
                 JOIN {self._nodes} n ON n.id = t.node_id
                 LIMIT $3
@@ -411,6 +434,8 @@ def _row_to_node(row: asyncpg.Record) -> dict[str, Any]:
         "created_at": row["created_at"],
         "last_accessed": row["last_accessed"],
         "metadata": meta if isinstance(meta, dict) else {},
+        "valid_from": row["valid_from"] if "valid_from" in row.keys() else None,
+        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
     }
 
 
