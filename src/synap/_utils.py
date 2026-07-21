@@ -7,8 +7,18 @@ from typing import Any
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two vectors."""
-    if len(a) != len(b) or len(a) == 0:
+    """Cosine similarity between two vectors.
+
+    Raises ValueError on a dimension mismatch rather than returning 0.0: a
+    length mismatch is a configuration bug (embeddings from different models or
+    a truncated store), and silently scoring it as zero hides that bug behind a
+    plausible-looking ranking.
+    """
+    if len(a) != len(b):
+        raise ValueError(
+            f"embedding dimension mismatch: {len(a)} vs {len(b)}"
+        )
+    if len(a) == 0:
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = sum(x * x for x in a) ** 0.5

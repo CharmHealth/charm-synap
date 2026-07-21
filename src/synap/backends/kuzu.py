@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,6 @@ import kuzu
 # ---------------------------------------------------------------------------
 # Schema constants
 # ---------------------------------------------------------------------------
-
-EMBEDDING_DIM_DEFAULT = 8  # Overridden at init based on actual embeddings
 
 _SCHEMA_SQL = """
 CREATE NODE TABLE IF NOT EXISTS MemoryNode(
@@ -60,7 +59,7 @@ class KuzuBackend:
     def __init__(
         self,
         path: str | Path,
-        embedding_dim: int = EMBEDDING_DIM_DEFAULT,
+        embedding_dim: int,
         buffer_pool_mb: int = 256,
     ) -> None:
         self._path = str(path)
@@ -73,8 +72,21 @@ class KuzuBackend:
         return kuzu.Connection(self._db)
 
     def _ensure_schema(self) -> None:
-        """Idempotent schema creation."""
+        """Idempotent schema creation.
+
+        On reopen, the embedding-column dimension is fixed at CREATE time, so a
+        caller who opens an existing store with a different ``embedding_dim``
+        than it was created with would silently write vectors the schema can't
+        hold. Validate the persisted dimension and fail loud instead.
+        """
         conn = self._conn()
+        existing_dim = self._persisted_embedding_dim(conn)
+        if existing_dim is not None and existing_dim != self._embedding_dim:
+            raise ValueError(
+                f"Kuzu store at {self._path} was created with embedding_dim="
+                f"{existing_dim}, but embedding_dim={self._embedding_dim} was "
+                f"requested; the on-disk vector column cannot be resized"
+            )
         for stmt in _SCHEMA_SQL.format(dim=self._embedding_dim).split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -82,6 +94,25 @@ class KuzuBackend:
                     conn.execute(stmt)
                 except RuntimeError:
                     pass  # Table already exists
+
+    def _persisted_embedding_dim(self, conn: kuzu.Connection) -> int | None:
+        """The embedding-column dimension of an existing MemoryNode table, if any.
+
+        Returns None when the table does not exist yet (fresh database).
+        """
+        try:
+            result = conn.execute("CALL TABLE_INFO('MemoryNode') RETURN *")
+        except RuntimeError:
+            return None  # table not created yet
+        for row in self._collect_rows(result):
+            cells = [c for c in row if isinstance(c, str)]
+            if not any(c == "embedding" for c in cells):
+                continue
+            for c in cells:
+                m = re.search(r"\[(\d+)\]", c)
+                if m:
+                    return int(m.group(1))
+        return None
 
     # --- Node operations ---
 
@@ -410,6 +441,11 @@ class KuzuBackend:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Native cosine similarity via Kùzu's array_cosine_similarity."""
+        if len(embedding) != self._embedding_dim:
+            raise ValueError(
+                f"query embedding has {len(embedding)} dims but this backend is "
+                f"configured for {self._embedding_dim}"
+            )
         cast_expr = f"cast($emb, 'DOUBLE[{self._embedding_dim}]')"
         conn = self._conn()
 
@@ -509,12 +545,13 @@ class KuzuBackend:
     def _format_embedding(self, embedding: list[float] | None) -> list[float] | None:
         if embedding is None:
             return None
-        # Pad or truncate to configured dimension
         emb = [float(x) for x in embedding]
-        if len(emb) < self._embedding_dim:
-            emb.extend([0.0] * (self._embedding_dim - len(emb)))
-        elif len(emb) > self._embedding_dim:
-            emb = emb[: self._embedding_dim]
+        if len(emb) != self._embedding_dim:
+            raise ValueError(
+                f"embedding has {len(emb)} dims but this backend is configured "
+                f"for {self._embedding_dim}; refusing to store a truncated or "
+                f"padded vector (was the embedder or embedding_dim misconfigured?)"
+            )
         return emb
 
     def _row_to_node(self, row: list) -> dict[str, Any]:
