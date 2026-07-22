@@ -42,7 +42,7 @@ def select_evictions(
     victims: list[str] = []
     episodes: dict[str, list[tuple[str, float]]] = {}
     for node_id, score, episode_id in items:
-        if episode_id is None:
+        if not episode_id:  # None or "" -> a standalone (non-episodic) node
             if score < threshold:
                 victims.append(node_id)
         else:

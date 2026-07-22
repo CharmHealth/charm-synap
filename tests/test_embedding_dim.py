@@ -103,6 +103,34 @@ def test_sqlite_similarity_rejects_wrong_dim_query(tmp_path):
         db.close()
 
 
+def test_sqlite_similarity_raises_clearly_on_mixed_dim_store(tmp_path):
+    """A store with inconsistent embedding dims fails loud, not with a cryptic
+    error mid-loop — the message names the offending node."""
+    db = SQLiteBackend(tmp_path / "g.db")
+    try:
+        db.save_node(_node("n1", embedding=[1.0, 0.0, 0.0]))
+        db.save_node(_node("n2", embedding=[1.0, 0.0]))  # SQLite enforces no dim
+        with pytest.raises(ValueError, match="inconsistent embedding dimensions"):
+            db.similarity_search([1.0, 0.0, 0.0], limit=5)
+    finally:
+        db.close()
+
+
+async def test_graph_similarity_raises_clearly_on_mixed_dim_store():
+    from synap.graph import MemoryGraph
+    from synap.types import MemoryNode, MemoryType
+
+    g = MemoryGraph()
+    await g.add_node(
+        MemoryNode(id="a", node_type=MemoryType.SEMANTIC, content="c", embedding=[1.0, 0.0, 0.0])
+    )
+    await g.add_node(
+        MemoryNode(id="b", node_type=MemoryType.SEMANTIC, content="c", embedding=[1.0, 0.0])
+    )
+    with pytest.raises(ValueError, match="inconsistent embedding dimensions"):
+        await g.similarity_search([1.0, 0.0, 0.0])
+
+
 # Note: the optional embedder-`dimension` hint and the MCP-server wiring
 # (deriving the backend dim from the embedder, ENGRAM_* -> SYNAP_* rename,
 # dropping the tests.conftest import) belong to J5 subtask 5 ("embedding model

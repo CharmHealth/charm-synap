@@ -273,6 +273,12 @@ class MemoryGraph:
                 continue
             if node.embedding is None:
                 continue
+            if len(node.embedding) != len(embedding):
+                raise ValueError(
+                    f"embedding dimension mismatch in similarity search: query has "
+                    f"{len(embedding)}, node {node.id} has {len(node.embedding)}; "
+                    f"the store holds inconsistent embedding dimensions"
+                )
             sim = cosine_similarity(embedding, node.embedding)
             candidates.append((sim, node))
         candidates.sort(key=lambda x: x[0], reverse=True)

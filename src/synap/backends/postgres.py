@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS {prefix}nodes (
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_type ON {prefix}nodes(node_type);
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_utility ON {prefix}nodes(utility_score);
 
+-- Forward-migrate a store created before these columns existed (idempotent).
+-- Additive-only; a versioned migration path is ROADMAP task 7.
+ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
+ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
+
 CREATE TABLE IF NOT EXISTS {prefix}edges (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES {prefix}nodes(id) ON DELETE CASCADE,

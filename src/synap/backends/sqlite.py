@@ -253,6 +253,13 @@ class SQLiteBackend:
 
         for row in rows:
             node_embedding = json.loads(row["embedding"])
+            if len(node_embedding) != len(embedding):
+                data = json.loads(row["data"])
+                raise ValueError(
+                    f"embedding dimension mismatch in similarity search: query has "
+                    f"{len(embedding)}, node {data.get('id')} has {len(node_embedding)}; "
+                    f"the store holds inconsistent embedding dimensions"
+                )
             sim = cosine_similarity(embedding, node_embedding)
             scored.append((sim, json.loads(row["data"])))
 

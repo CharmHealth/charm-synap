@@ -97,6 +97,15 @@ class KuzuBackend:
                 except RuntimeError:
                     pass  # Table already exists
 
+        # Forward-migrate a store created before a column existed. Kuzu's
+        # ALTER ... ADD has no IF NOT EXISTS, so swallow the "already exists"
+        # error. Additive-only; a versioned migration path is ROADMAP task 7.
+        for column in ("valid_from", "valid_until"):
+            try:
+                conn.execute(f"ALTER TABLE MemoryNode ADD {column} STRING")
+            except RuntimeError:
+                pass  # column already present
+
     def _persisted_embedding_dim(self, conn: kuzu.Connection) -> int | None:
         """The embedding-column dimension of an existing MemoryNode table, if any.
 
@@ -352,27 +361,6 @@ class KuzuBackend:
                 "rate": decay_rate,
             },
         )
-
-    def evict_by_score(self, threshold: float) -> list[str]:
-        """Delete nodes with utility_score below threshold, server-side.
-
-        Returns IDs of evicted nodes.
-        """
-        conn = self._conn()
-        # Collect IDs first (lightweight — no embeddings)
-        result = conn.execute(
-            """
-            MATCH (n:MemoryNode)
-            WHERE n.utility_score < $threshold
-            RETURN n.id
-            """,
-            parameters={"threshold": threshold},
-        )
-        ids = [row[0] for row in self._collect_rows(result)]
-        # Delete each (handles edge cleanup)
-        for nid in ids:
-            self.delete_node(nid)
-        return ids
 
     # --- Delete ---
 
