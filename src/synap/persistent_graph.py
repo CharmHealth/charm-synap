@@ -8,6 +8,7 @@ import math
 from datetime import datetime, timezone
 from typing import Any
 
+from synap._utils import select_evictions
 from synap.protocols import AsyncStorageBackend, StorageBackend
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
@@ -131,6 +132,24 @@ class PersistentGraph:
     async def add_node(self, node: MemoryNode) -> str:
         await self._call(self._backend.save_node, _node_to_dict(node))
         return node.id
+
+    async def write_batch(
+        self, nodes: list[MemoryNode], edges: list[MemoryEdge]
+    ) -> None:
+        """Persist nodes then edges in one transaction when the backend supports it.
+
+        Falls back to sequential (non-atomic) writes for backends without
+        write_batch — the in-memory graph and any future minimal backend.
+        """
+        node_dicts = [_node_to_dict(n) for n in nodes]
+        edge_dicts = [_edge_to_dict(e) for e in edges]
+        if hasattr(self._backend, "write_batch"):
+            await self._call(self._backend.write_batch, node_dicts, edge_dicts)
+        else:
+            for d in node_dicts:
+                await self._call(self._backend.save_node, d)
+            for d in edge_dicts:
+                await self._call(self._backend.save_edge, d)
 
     async def get_node(self, node_id: str) -> MemoryNode | None:
         d = await self._call(self._backend.load_node, node_id)
@@ -265,20 +284,27 @@ class PersistentGraph:
                 await self._call(self._backend.save_node, d)
 
     async def evict(self, threshold: float = 0.1) -> list[str]:
-        # Server-side path: query only IDs below threshold, delete in DB
-        if hasattr(self._backend, "evict_by_score"):
-            return await self._call(self._backend.evict_by_score, threshold)
-
-        # Fallback for backends without server-side evict
+        # Episode-aware eviction: whole episode or nothing (see select_evictions).
+        # This can't stay server-side — Kuzu stores metadata as a JSON string, so
+        # grouping episodic nodes by episode_id happens here, not in the query.
         all_nodes = await self._call(
             self._backend.query_nodes, None, None, 100_000
         )
-        to_evict = []
-        for d in all_nodes:
-            if d.get("utility_score", 1.0) < threshold:
-                to_evict.append(d["id"])
-        for nid in to_evict:
-            await self._call(self._backend.delete_node, nid)
+        items = [
+            (
+                d["id"],
+                d.get("utility_score", 1.0),
+                (d.get("metadata") or {}).get("episode_id"),
+            )
+            for d in all_nodes
+        ]
+        to_evict = select_evictions(items, threshold)
+        if to_evict:
+            if hasattr(self._backend, "delete_nodes_batch"):
+                await self._call(self._backend.delete_nodes_batch, to_evict)
+            else:
+                for nid in to_evict:
+                    await self._call(self._backend.delete_node, nid)
         return to_evict
 
     # --- Edges between specific nodes ---

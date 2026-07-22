@@ -28,6 +28,31 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def select_evictions(
+    items: list[tuple[str, float, str | None]], threshold: float
+) -> list[str]:
+    """Decide which node ids to evict, treating an episode as one unit.
+
+    ``items`` is ``(node_id, utility_score, episode_id_or_None)``. A node with no
+    ``episode_id`` is evicted individually when its score is below ``threshold``.
+    An episode's nodes are evicted only when *every* member is below threshold —
+    "whole episode or nothing" — so decay of one node can't shear the episode
+    into unreadable orphans (policy B1).
+    """
+    victims: list[str] = []
+    episodes: dict[str, list[tuple[str, float]]] = {}
+    for node_id, score, episode_id in items:
+        if episode_id is None:
+            if score < threshold:
+                victims.append(node_id)
+        else:
+            episodes.setdefault(episode_id, []).append((node_id, score))
+    for members in episodes.values():
+        if all(score < threshold for _, score in members):
+            victims.extend(node_id for node_id, _ in members)
+    return victims
+
+
 def safe_parse_json(text: str) -> dict[str, Any] | None:
     """Parse JSON from LLM output, handling common formatting issues."""
     text = text.strip()

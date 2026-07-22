@@ -112,42 +112,45 @@ class PostgresBackend:
 
     # --- Node operations ---
 
-    async def save_node(self, node: dict[str, Any]) -> None:
+    async def _write_node(self, conn: asyncpg.Connection, node: dict[str, Any]) -> None:
+        """Upsert one node on the given connection (for save_node and batches)."""
         embedding = node.get("embedding")
         embedding_str = _format_vector(embedding) if embedding else None
+        await conn.execute(
+            f"""
+            INSERT INTO {self._nodes}
+                (id, node_type, content, embedding, utility_score,
+                 access_count, created_at, last_accessed, metadata,
+                 valid_from, valid_until)
+            VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
+                    $10::timestamptz, $11::timestamptz)
+            ON CONFLICT (id) DO UPDATE SET
+                node_type = EXCLUDED.node_type,
+                content = EXCLUDED.content,
+                embedding = EXCLUDED.embedding,
+                utility_score = EXCLUDED.utility_score,
+                access_count = EXCLUDED.access_count,
+                last_accessed = EXCLUDED.last_accessed,
+                metadata = EXCLUDED.metadata,
+                valid_from = EXCLUDED.valid_from,
+                valid_until = EXCLUDED.valid_until
+            """,
+            node["id"],
+            node["node_type"],
+            node["content"],
+            embedding_str,
+            float(node.get("utility_score", 1.0)),
+            int(node.get("access_count", 0)),
+            _coerce_timestamp(node.get("created_at")),
+            _coerce_timestamp(node.get("last_accessed")),
+            json.dumps(node.get("metadata", {})),
+            _coerce_timestamp_optional(node.get("valid_from")),
+            _coerce_timestamp_optional(node.get("valid_until")),
+        )
 
+    async def save_node(self, node: dict[str, Any]) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {self._nodes}
-                    (id, node_type, content, embedding, utility_score,
-                     access_count, created_at, last_accessed, metadata,
-                     valid_from, valid_until)
-                VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
-                        $10::timestamptz, $11::timestamptz)
-                ON CONFLICT (id) DO UPDATE SET
-                    node_type = EXCLUDED.node_type,
-                    content = EXCLUDED.content,
-                    embedding = EXCLUDED.embedding,
-                    utility_score = EXCLUDED.utility_score,
-                    access_count = EXCLUDED.access_count,
-                    last_accessed = EXCLUDED.last_accessed,
-                    metadata = EXCLUDED.metadata,
-                    valid_from = EXCLUDED.valid_from,
-                    valid_until = EXCLUDED.valid_until
-                """,
-                node["id"],
-                node["node_type"],
-                node["content"],
-                embedding_str,
-                float(node.get("utility_score", 1.0)),
-                int(node.get("access_count", 0)),
-                _coerce_timestamp(node.get("created_at")),
-                _coerce_timestamp(node.get("last_accessed")),
-                json.dumps(node.get("metadata", {})),
-                _coerce_timestamp_optional(node.get("valid_from")),
-                _coerce_timestamp_optional(node.get("valid_until")),
-            )
+            await self._write_node(conn, node)
 
     async def load_node(self, node_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
@@ -167,26 +170,41 @@ class PostgresBackend:
 
     # --- Edge operations ---
 
+    async def _write_edge(self, conn: asyncpg.Connection, edge: dict[str, Any]) -> None:
+        """Upsert one edge on the given connection (for save_edge and batches)."""
+        await conn.execute(
+            f"""
+            INSERT INTO {self._edges}
+                (id, source_id, target_id, relation_type, weight, created_at, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb)
+            ON CONFLICT (id) DO UPDATE SET
+                relation_type = EXCLUDED.relation_type,
+                weight = EXCLUDED.weight,
+                metadata = EXCLUDED.metadata
+            """,
+            edge["id"],
+            edge["source_id"],
+            edge["target_id"],
+            edge["relation_type"],
+            float(edge.get("weight", 1.0)),
+            _coerce_timestamp(edge.get("created_at")),
+            json.dumps(edge.get("metadata", {})),
+        )
+
     async def save_edge(self, edge: dict[str, Any]) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {self._edges}
-                    (id, source_id, target_id, relation_type, weight, created_at, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb)
-                ON CONFLICT (id) DO UPDATE SET
-                    relation_type = EXCLUDED.relation_type,
-                    weight = EXCLUDED.weight,
-                    metadata = EXCLUDED.metadata
-                """,
-                edge["id"],
-                edge["source_id"],
-                edge["target_id"],
-                edge["relation_type"],
-                float(edge.get("weight", 1.0)),
-                _coerce_timestamp(edge.get("created_at")),
-                json.dumps(edge.get("metadata", {})),
-            )
+            await self._write_edge(conn, edge)
+
+    async def write_batch(
+        self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+    ) -> None:
+        """Write nodes then edges atomically in one transaction; rolls back on error."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                for node in nodes:
+                    await self._write_node(conn, node)
+                for edge in edges:
+                    await self._write_edge(conn, edge)
 
     async def load_edges(
         self, node_id: str, edge_type: str | None = None
@@ -289,6 +307,18 @@ class PostgresBackend:
             # Edges deleted by ON DELETE CASCADE
             await conn.execute(
                 f"DELETE FROM {self._nodes} WHERE id = $1", node_id
+            )
+
+    async def delete_nodes_batch(self, node_ids: list[str]) -> None:
+        """Delete multiple nodes (edges cascade) atomically in one statement.
+
+        Used to evict a whole episode all-or-nothing.
+        """
+        if not node_ids:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"DELETE FROM {self._nodes} WHERE id = ANY($1::text[])", node_ids
             )
 
     async def delete_edge(self, edge_id: str) -> None:

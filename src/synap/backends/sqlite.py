@@ -62,7 +62,8 @@ class SQLiteBackend:
         """)
         self._conn.commit()
 
-    def save_node(self, node: dict[str, Any]) -> None:
+    def _write_node_row(self, node: dict[str, Any]) -> None:
+        """Execute a node upsert without committing (for batching)."""
         embedding_json = (
             json.dumps(node.get("embedding"))
             if node.get("embedding") is not None
@@ -86,9 +87,13 @@ class SQLiteBackend:
                 json.dumps(node),
             ),
         )
+
+    def save_node(self, node: dict[str, Any]) -> None:
+        self._write_node_row(node)
         self._conn.commit()
 
-    def save_edge(self, edge: dict[str, Any]) -> None:
+    def _write_edge_row(self, edge: dict[str, Any]) -> None:
+        """Execute an edge upsert without committing (for batching)."""
         self._conn.execute(
             """INSERT OR REPLACE INTO edges
                (id, source_id, target_id, relation_type, weight,
@@ -105,7 +110,24 @@ class SQLiteBackend:
                 json.dumps(edge),
             ),
         )
+
+    def save_edge(self, edge: dict[str, Any]) -> None:
+        self._write_edge_row(edge)
         self._conn.commit()
+
+    def write_batch(
+        self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+    ) -> None:
+        """Write nodes then edges atomically, committing once; roll back on error."""
+        try:
+            for node in nodes:
+                self._write_node_row(node)
+            for edge in edges:
+                self._write_edge_row(edge)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def load_node(self, node_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -187,13 +209,27 @@ class SQLiteBackend:
             row = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()
         return row[0]
 
-    def delete_node(self, node_id: str) -> None:
+    def _delete_node_rows(self, node_id: str) -> None:
+        """Delete a node and its edges without committing (for batching)."""
         self._conn.execute(
             "DELETE FROM edges WHERE source_id = ? OR target_id = ?",
             (node_id, node_id),
         )
         self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
+
+    def delete_node(self, node_id: str) -> None:
+        self._delete_node_rows(node_id)
         self._conn.commit()
+
+    def delete_nodes_batch(self, node_ids: list[str]) -> None:
+        """Delete multiple nodes (and their edges) atomically, one commit."""
+        try:
+            for node_id in node_ids:
+                self._delete_node_rows(node_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def delete_edge(self, edge_id: str) -> None:
         self._conn.execute("DELETE FROM edges WHERE id = ?", (edge_id,))

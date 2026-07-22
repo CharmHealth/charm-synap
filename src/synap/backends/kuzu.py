@@ -118,60 +118,11 @@ class KuzuBackend:
 
     # --- Node operations ---
 
-    def save_nodes_batch(self, nodes: list[dict[str, Any]]) -> None:
-        """Upsert multiple nodes using a single connection."""
-        if not nodes:
-            return
-        conn = self._conn()
-        for node in nodes:
-            embedding = node.get("embedding")
-            embedding_val = self._format_embedding(embedding) if embedding else None
-            conn.execute(
-                """
-                MERGE (n:MemoryNode {id: $id})
-                ON CREATE SET
-                    n.node_type = $node_type,
-                    n.content = $content,
-                    n.embedding = $embedding,
-                    n.utility_score = $utility_score,
-                    n.access_count = $access_count,
-                    n.created_at = $created_at,
-                    n.last_accessed = $last_accessed,
-                    n.metadata = $metadata,
-                    n.valid_from = $valid_from,
-                    n.valid_until = $valid_until
-                ON MATCH SET
-                    n.node_type = $node_type,
-                    n.content = $content,
-                    n.embedding = $embedding,
-                    n.utility_score = $utility_score,
-                    n.access_count = $access_count,
-                    n.last_accessed = $last_accessed,
-                    n.metadata = $metadata,
-                    n.valid_from = $valid_from,
-                    n.valid_until = $valid_until
-                """,
-                parameters={
-                    "id": node["id"],
-                    "node_type": node["node_type"],
-                    "content": node["content"],
-                    "embedding": embedding_val,
-                    "utility_score": float(node.get("utility_score", 1.0)),
-                    "access_count": int(node.get("access_count", 0)),
-                    "created_at": node.get("created_at", _now_iso()),
-                    "last_accessed": node.get("last_accessed", _now_iso()),
-                    "metadata": json.dumps(node.get("metadata", {})),
-                    "valid_from": node.get("valid_from"),
-                    "valid_until": node.get("valid_until"),
-                },
-            )
-
-    def save_node(self, node: dict[str, Any]) -> None:
-        """Upsert a node using MERGE."""
+    def _write_node(self, conn: kuzu.Connection, node: dict[str, Any]) -> None:
+        """Upsert one node on the given connection (dim-checked embedding)."""
         embedding = node.get("embedding")
         embedding_val = self._format_embedding(embedding) if embedding else None
-
-        self._conn().execute(
+        conn.execute(
             """
             MERGE (n:MemoryNode {id: $id})
             ON CREATE SET
@@ -211,6 +162,18 @@ class KuzuBackend:
             },
         )
 
+    def save_nodes_batch(self, nodes: list[dict[str, Any]]) -> None:
+        """Upsert multiple nodes using a single connection."""
+        if not nodes:
+            return
+        conn = self._conn()
+        for node in nodes:
+            self._write_node(conn, node)
+
+    def save_node(self, node: dict[str, Any]) -> None:
+        """Upsert a node using MERGE."""
+        self._write_node(self._conn(), node)
+
     def load_node(self, node_id: str) -> dict[str, Any] | None:
         result = self._conn().execute(
             """
@@ -229,9 +192,9 @@ class KuzuBackend:
 
     # --- Edge operations ---
 
-    def save_edge(self, edge: dict[str, Any]) -> None:
-        """Create an edge between existing nodes."""
-        self._conn().execute(
+    def _write_edge(self, conn: kuzu.Connection, edge: dict[str, Any]) -> None:
+        """Create one edge between existing nodes on the given connection."""
+        conn.execute(
             """
             MATCH (s:MemoryNode {id: $source_id}), (t:MemoryNode {id: $target_id})
             CREATE (s)-[:MemoryEdge {
@@ -252,6 +215,33 @@ class KuzuBackend:
                 "metadata": json.dumps(edge.get("metadata", {})),
             },
         )
+
+    def save_edge(self, edge: dict[str, Any]) -> None:
+        """Create an edge between existing nodes."""
+        self._write_edge(self._conn(), edge)
+
+    def write_batch(
+        self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+    ) -> None:
+        """Write nodes then edges atomically in one transaction.
+
+        For multi-node structures (an episode = 3 nodes + edges) that must not
+        be sheared by a mid-write failure. Rolls back on any error.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for node in nodes:
+                self._write_node(conn, node)
+            for edge in edges:
+                self._write_edge(conn, edge)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def load_edges(
         self, node_id: str, edge_type: str | None = None
@@ -386,30 +376,45 @@ class KuzuBackend:
 
     # --- Delete ---
 
-    def delete_node(self, node_id: str) -> None:
-        conn = self._conn()
+    def _delete_node_on(self, conn: kuzu.Connection, node_id: str) -> None:
+        """Delete a node and its edges on the given connection."""
         # Delete connected edges first (Kùzu requires directed deletes)
         conn.execute(
-            """
-            MATCH (n:MemoryNode {id: $id})-[e:MemoryEdge]->()
-            DELETE e
-            """,
+            "MATCH (n:MemoryNode {id: $id})-[e:MemoryEdge]->() DELETE e",
             parameters={"id": node_id},
         )
         conn.execute(
-            """
-            MATCH ()-[e:MemoryEdge]->(n:MemoryNode {id: $id})
-            DELETE e
-            """,
+            "MATCH ()-[e:MemoryEdge]->(n:MemoryNode {id: $id}) DELETE e",
             parameters={"id": node_id},
         )
         conn.execute(
-            """
-            MATCH (n:MemoryNode {id: $id})
-            DELETE n
-            """,
+            "MATCH (n:MemoryNode {id: $id}) DELETE n",
             parameters={"id": node_id},
         )
+
+    def delete_node(self, node_id: str) -> None:
+        self._delete_node_on(self._conn(), node_id)
+
+    def delete_nodes_batch(self, node_ids: list[str]) -> None:
+        """Delete multiple nodes (and their edges) atomically in one transaction.
+
+        Used to evict a whole episode all-or-nothing, so eviction can't shear an
+        episode the way per-node deletes could.
+        """
+        if not node_ids:
+            return
+        conn = self._conn()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for node_id in node_ids:
+                self._delete_node_on(conn, node_id)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def delete_edge(self, edge_id: str) -> None:
         self._conn().execute(
