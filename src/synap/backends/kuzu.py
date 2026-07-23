@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,6 @@ import kuzu
 # ---------------------------------------------------------------------------
 # Schema constants
 # ---------------------------------------------------------------------------
-
-EMBEDDING_DIM_DEFAULT = 8  # Overridden at init based on actual embeddings
 
 _SCHEMA_SQL = """
 CREATE NODE TABLE IF NOT EXISTS MemoryNode(
@@ -27,6 +26,8 @@ CREATE NODE TABLE IF NOT EXISTS MemoryNode(
     created_at STRING,
     last_accessed STRING,
     metadata STRING DEFAULT '{{}}',
+    valid_from STRING,
+    valid_until STRING,
     PRIMARY KEY(id)
 );
 
@@ -60,7 +61,7 @@ class KuzuBackend:
     def __init__(
         self,
         path: str | Path,
-        embedding_dim: int = EMBEDDING_DIM_DEFAULT,
+        embedding_dim: int,
         buffer_pool_mb: int = 256,
     ) -> None:
         self._path = str(path)
@@ -73,8 +74,21 @@ class KuzuBackend:
         return kuzu.Connection(self._db)
 
     def _ensure_schema(self) -> None:
-        """Idempotent schema creation."""
+        """Idempotent schema creation.
+
+        On reopen, the embedding-column dimension is fixed at CREATE time, so a
+        caller who opens an existing store with a different ``embedding_dim``
+        than it was created with would silently write vectors the schema can't
+        hold. Validate the persisted dimension and fail loud instead.
+        """
         conn = self._conn()
+        existing_dim = self._persisted_embedding_dim(conn)
+        if existing_dim is not None and existing_dim != self._embedding_dim:
+            raise ValueError(
+                f"Kuzu store at {self._path} was created with embedding_dim="
+                f"{existing_dim}, but embedding_dim={self._embedding_dim} was "
+                f"requested; the on-disk vector column cannot be resized"
+            )
         for stmt in _SCHEMA_SQL.format(dim=self._embedding_dim).split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -83,56 +97,41 @@ class KuzuBackend:
                 except RuntimeError:
                     pass  # Table already exists
 
+        # Forward-migrate a store created before a column existed. Kuzu's
+        # ALTER ... ADD has no IF NOT EXISTS, so swallow the "already exists"
+        # error. Additive-only; a versioned migration path is ROADMAP task 7.
+        for column in ("valid_from", "valid_until"):
+            try:
+                conn.execute(f"ALTER TABLE MemoryNode ADD {column} STRING")
+            except RuntimeError:
+                pass  # column already present
+
+    def _persisted_embedding_dim(self, conn: kuzu.Connection) -> int | None:
+        """The embedding-column dimension of an existing MemoryNode table, if any.
+
+        Returns None when the table does not exist yet (fresh database).
+        """
+        try:
+            result = conn.execute("CALL TABLE_INFO('MemoryNode') RETURN *")
+        except RuntimeError:
+            return None  # table not created yet
+        for row in self._collect_rows(result):
+            cells = [c for c in row if isinstance(c, str)]
+            if not any(c == "embedding" for c in cells):
+                continue
+            for c in cells:
+                m = re.search(r"\[(\d+)\]", c)
+                if m:
+                    return int(m.group(1))
+        return None
+
     # --- Node operations ---
 
-    def save_nodes_batch(self, nodes: list[dict[str, Any]]) -> None:
-        """Upsert multiple nodes using a single connection."""
-        if not nodes:
-            return
-        conn = self._conn()
-        for node in nodes:
-            embedding = node.get("embedding")
-            embedding_val = self._format_embedding(embedding) if embedding else None
-            conn.execute(
-                """
-                MERGE (n:MemoryNode {id: $id})
-                ON CREATE SET
-                    n.node_type = $node_type,
-                    n.content = $content,
-                    n.embedding = $embedding,
-                    n.utility_score = $utility_score,
-                    n.access_count = $access_count,
-                    n.created_at = $created_at,
-                    n.last_accessed = $last_accessed,
-                    n.metadata = $metadata
-                ON MATCH SET
-                    n.node_type = $node_type,
-                    n.content = $content,
-                    n.embedding = $embedding,
-                    n.utility_score = $utility_score,
-                    n.access_count = $access_count,
-                    n.last_accessed = $last_accessed,
-                    n.metadata = $metadata
-                """,
-                parameters={
-                    "id": node["id"],
-                    "node_type": node["node_type"],
-                    "content": node["content"],
-                    "embedding": embedding_val,
-                    "utility_score": float(node.get("utility_score", 1.0)),
-                    "access_count": int(node.get("access_count", 0)),
-                    "created_at": node.get("created_at", _now_iso()),
-                    "last_accessed": node.get("last_accessed", _now_iso()),
-                    "metadata": json.dumps(node.get("metadata", {})),
-                },
-            )
-
-    def save_node(self, node: dict[str, Any]) -> None:
-        """Upsert a node using MERGE."""
+    def _write_node(self, conn: kuzu.Connection, node: dict[str, Any]) -> None:
+        """Upsert one node on the given connection (dim-checked embedding)."""
         embedding = node.get("embedding")
         embedding_val = self._format_embedding(embedding) if embedding else None
-
-        self._conn().execute(
+        conn.execute(
             """
             MERGE (n:MemoryNode {id: $id})
             ON CREATE SET
@@ -143,7 +142,9 @@ class KuzuBackend:
                 n.access_count = $access_count,
                 n.created_at = $created_at,
                 n.last_accessed = $last_accessed,
-                n.metadata = $metadata
+                n.metadata = $metadata,
+                n.valid_from = $valid_from,
+                n.valid_until = $valid_until
             ON MATCH SET
                 n.node_type = $node_type,
                 n.content = $content,
@@ -151,7 +152,9 @@ class KuzuBackend:
                 n.utility_score = $utility_score,
                 n.access_count = $access_count,
                 n.last_accessed = $last_accessed,
-                n.metadata = $metadata
+                n.metadata = $metadata,
+                n.valid_from = $valid_from,
+                n.valid_until = $valid_until
             """,
             parameters={
                 "id": node["id"],
@@ -163,8 +166,22 @@ class KuzuBackend:
                 "created_at": node.get("created_at", _now_iso()),
                 "last_accessed": node.get("last_accessed", _now_iso()),
                 "metadata": json.dumps(node.get("metadata", {})),
+                "valid_from": node.get("valid_from"),
+                "valid_until": node.get("valid_until"),
             },
         )
+
+    def save_nodes_batch(self, nodes: list[dict[str, Any]]) -> None:
+        """Upsert multiple nodes using a single connection."""
+        if not nodes:
+            return
+        conn = self._conn()
+        for node in nodes:
+            self._write_node(conn, node)
+
+    def save_node(self, node: dict[str, Any]) -> None:
+        """Upsert a node using MERGE."""
+        self._write_node(self._conn(), node)
 
     def load_node(self, node_id: str) -> dict[str, Any] | None:
         result = self._conn().execute(
@@ -172,7 +189,8 @@ class KuzuBackend:
             MATCH (n:MemoryNode {id: $id})
             RETURN n.id, n.node_type, n.content, n.embedding,
                    n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata
+                   n.created_at, n.last_accessed, n.metadata,
+                   n.valid_from, n.valid_until
             """,
             parameters={"id": node_id},
         )
@@ -183,9 +201,9 @@ class KuzuBackend:
 
     # --- Edge operations ---
 
-    def save_edge(self, edge: dict[str, Any]) -> None:
-        """Create an edge between existing nodes."""
-        self._conn().execute(
+    def _write_edge(self, conn: kuzu.Connection, edge: dict[str, Any]) -> None:
+        """Create one edge between existing nodes on the given connection."""
+        conn.execute(
             """
             MATCH (s:MemoryNode {id: $source_id}), (t:MemoryNode {id: $target_id})
             CREATE (s)-[:MemoryEdge {
@@ -206,6 +224,33 @@ class KuzuBackend:
                 "metadata": json.dumps(edge.get("metadata", {})),
             },
         )
+
+    def save_edge(self, edge: dict[str, Any]) -> None:
+        """Create an edge between existing nodes."""
+        self._write_edge(self._conn(), edge)
+
+    def write_batch(
+        self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+    ) -> None:
+        """Write nodes then edges atomically in one transaction.
+
+        For multi-node structures (an episode = 3 nodes + edges) that must not
+        be sheared by a mid-write failure. Rolls back on any error.
+        """
+        conn = self._conn()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for node in nodes:
+                self._write_node(conn, node)
+            for edge in edges:
+                self._write_edge(conn, edge)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def load_edges(
         self, node_id: str, edge_type: str | None = None
@@ -265,7 +310,8 @@ class KuzuBackend:
             {where}
             RETURN n.id, n.node_type, n.content, n.embedding,
                    n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata
+                   n.created_at, n.last_accessed, n.metadata,
+                   n.valid_from, n.valid_until
             ORDER BY n.utility_score DESC
             {limit_clause}
             """,
@@ -316,53 +362,47 @@ class KuzuBackend:
             },
         )
 
-    def evict_by_score(self, threshold: float) -> list[str]:
-        """Delete nodes with utility_score below threshold, server-side.
-
-        Returns IDs of evicted nodes.
-        """
-        conn = self._conn()
-        # Collect IDs first (lightweight — no embeddings)
-        result = conn.execute(
-            """
-            MATCH (n:MemoryNode)
-            WHERE n.utility_score < $threshold
-            RETURN n.id
-            """,
-            parameters={"threshold": threshold},
-        )
-        ids = [row[0] for row in self._collect_rows(result)]
-        # Delete each (handles edge cleanup)
-        for nid in ids:
-            self.delete_node(nid)
-        return ids
-
     # --- Delete ---
 
-    def delete_node(self, node_id: str) -> None:
-        conn = self._conn()
+    def _delete_node_on(self, conn: kuzu.Connection, node_id: str) -> None:
+        """Delete a node and its edges on the given connection."""
         # Delete connected edges first (Kùzu requires directed deletes)
         conn.execute(
-            """
-            MATCH (n:MemoryNode {id: $id})-[e:MemoryEdge]->()
-            DELETE e
-            """,
+            "MATCH (n:MemoryNode {id: $id})-[e:MemoryEdge]->() DELETE e",
             parameters={"id": node_id},
         )
         conn.execute(
-            """
-            MATCH ()-[e:MemoryEdge]->(n:MemoryNode {id: $id})
-            DELETE e
-            """,
+            "MATCH ()-[e:MemoryEdge]->(n:MemoryNode {id: $id}) DELETE e",
             parameters={"id": node_id},
         )
         conn.execute(
-            """
-            MATCH (n:MemoryNode {id: $id})
-            DELETE n
-            """,
+            "MATCH (n:MemoryNode {id: $id}) DELETE n",
             parameters={"id": node_id},
         )
+
+    def delete_node(self, node_id: str) -> None:
+        self._delete_node_on(self._conn(), node_id)
+
+    def delete_nodes_batch(self, node_ids: list[str]) -> None:
+        """Delete multiple nodes (and their edges) atomically in one transaction.
+
+        Used to evict a whole episode all-or-nothing, so eviction can't shear an
+        episode the way per-node deletes could.
+        """
+        if not node_ids:
+            return
+        conn = self._conn()
+        conn.execute("BEGIN TRANSACTION")
+        try:
+            for node_id in node_ids:
+                self._delete_node_on(conn, node_id)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     def delete_edge(self, edge_id: str) -> None:
         self._conn().execute(
@@ -410,6 +450,11 @@ class KuzuBackend:
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Native cosine similarity via Kùzu's array_cosine_similarity."""
+        if len(embedding) != self._embedding_dim:
+            raise ValueError(
+                f"query embedding has {len(embedding)} dims but this backend is "
+                f"configured for {self._embedding_dim}"
+            )
         cast_expr = f"cast($emb, 'DOUBLE[{self._embedding_dim}]')"
         conn = self._conn()
 
@@ -421,7 +466,8 @@ class KuzuBackend:
                 WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
                 RETURN n.id, n.node_type, n.content, n.embedding,
                        n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata, sim
+                       n.created_at, n.last_accessed, n.metadata,
+                       n.valid_from, n.valid_until, sim
                 ORDER BY sim DESC
                 LIMIT $lim
                 """,
@@ -439,7 +485,8 @@ class KuzuBackend:
                 WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
                 RETURN n.id, n.node_type, n.content, n.embedding,
                        n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata, sim
+                       n.created_at, n.last_accessed, n.metadata,
+                       n.valid_from, n.valid_until, sim
                 ORDER BY sim DESC
                 LIMIT $lim
                 """,
@@ -496,7 +543,8 @@ class KuzuBackend:
             WITH DISTINCT neighbor
             RETURN neighbor.id, neighbor.node_type, neighbor.content, neighbor.embedding,
                    neighbor.utility_score, neighbor.access_count,
-                   neighbor.created_at, neighbor.last_accessed, neighbor.metadata
+                   neighbor.created_at, neighbor.last_accessed, neighbor.metadata,
+                   neighbor.valid_from, neighbor.valid_until
             LIMIT $lim
             """,
             parameters=params,
@@ -509,12 +557,13 @@ class KuzuBackend:
     def _format_embedding(self, embedding: list[float] | None) -> list[float] | None:
         if embedding is None:
             return None
-        # Pad or truncate to configured dimension
         emb = [float(x) for x in embedding]
-        if len(emb) < self._embedding_dim:
-            emb.extend([0.0] * (self._embedding_dim - len(emb)))
-        elif len(emb) > self._embedding_dim:
-            emb = emb[: self._embedding_dim]
+        if len(emb) != self._embedding_dim:
+            raise ValueError(
+                f"embedding has {len(emb)} dims but this backend is configured "
+                f"for {self._embedding_dim}; refusing to store a truncated or "
+                f"padded vector (was the embedder or embedding_dim misconfigured?)"
+            )
         return emb
 
     def _row_to_node(self, row: list) -> dict[str, Any]:
@@ -528,6 +577,8 @@ class KuzuBackend:
             "created_at": row[6],
             "last_accessed": row[7],
             "metadata": json.loads(row[8]) if isinstance(row[8], str) else row[8],
+            "valid_from": row[9] if len(row) > 9 else None,
+            "valid_until": row[10] if len(row) > 10 else None,
         }
 
     def _row_to_edge(self, row: list) -> dict[str, Any]:

@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from synap._utils import cosine_similarity
+from synap._utils import cosine_similarity, select_evictions
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 
@@ -34,6 +34,26 @@ class MemoryGraph:
     async def add_node(self, node: MemoryNode) -> str:
         self._nodes[node.id] = node
         return node.id
+
+    async def write_batch(
+        self, nodes: list[MemoryNode], edges: list[MemoryEdge]
+    ) -> None:
+        """Add nodes then edges atomically: on any failure, nothing is applied."""
+        node_backup = dict(self._nodes)
+        edge_backup = dict(self._edges)
+        out_backup = defaultdict(list, {k: list(v) for k, v in self._outgoing.items()})
+        in_backup = defaultdict(list, {k: list(v) for k, v in self._incoming.items()})
+        try:
+            for node in nodes:
+                await self.add_node(node)
+            for edge in edges:
+                await self.add_edge(edge)
+        except Exception:
+            self._nodes = node_backup
+            self._edges = edge_backup
+            self._outgoing = out_backup
+            self._incoming = in_backup
+            raise
 
     async def get_node(self, node_id: str) -> MemoryNode | None:
         return self._nodes.get(node_id)
@@ -208,11 +228,11 @@ class MemoryGraph:
             node.utility_score = decay + frequency_bonus
 
     async def evict(self, threshold: float = 0.1) -> list[str]:
-        to_evict = [
-            nid
+        items = [
+            (nid, node.utility_score, (node.metadata or {}).get("episode_id"))
             for nid, node in self._nodes.items()
-            if node.utility_score < threshold
         ]
+        to_evict = select_evictions(items, threshold)
         for nid in to_evict:
             await self.remove_node(nid)
         return to_evict
@@ -253,6 +273,12 @@ class MemoryGraph:
                 continue
             if node.embedding is None:
                 continue
+            if len(node.embedding) != len(embedding):
+                raise ValueError(
+                    f"embedding dimension mismatch in similarity search: query has "
+                    f"{len(embedding)}, node {node.id} has {len(node.embedding)}; "
+                    f"the store holds inconsistent embedding dimensions"
+                )
             sim = cosine_similarity(embedding, node.embedding)
             candidates.append((sim, node))
         candidates.sort(key=lambda x: x[0], reverse=True)

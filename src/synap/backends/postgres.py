@@ -31,6 +31,16 @@ def _coerce_timestamp(value: Any) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _coerce_timestamp_optional(value: Any) -> datetime | None:
+    """Like ``_coerce_timestamp`` but preserves ``None``.
+
+    Validity-window fields (``valid_from``/``valid_until``) are nullable — a
+    missing bound must stay NULL rather than defaulting to now()."""
+    if value is None:
+        return None
+    return _coerce_timestamp(value)
+
+
 _SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -43,11 +53,18 @@ CREATE TABLE IF NOT EXISTS {prefix}nodes (
     access_count INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL,
     last_accessed TIMESTAMPTZ NOT NULL,
-    metadata JSONB DEFAULT '{{}}'::jsonb
+    metadata JSONB DEFAULT '{{}}'::jsonb,
+    valid_from TIMESTAMPTZ,
+    valid_until TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_type ON {prefix}nodes(node_type);
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_utility ON {prefix}nodes(utility_score);
+
+-- Forward-migrate a store created before these columns existed (idempotent).
+-- Additive-only; a versioned migration path is ROADMAP task 7.
+ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
+ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
 
 CREATE TABLE IF NOT EXISTS {prefix}edges (
     id TEXT PRIMARY KEY,
@@ -100,36 +117,45 @@ class PostgresBackend:
 
     # --- Node operations ---
 
-    async def save_node(self, node: dict[str, Any]) -> None:
+    async def _write_node(self, conn: asyncpg.Connection, node: dict[str, Any]) -> None:
+        """Upsert one node on the given connection (for save_node and batches)."""
         embedding = node.get("embedding")
         embedding_str = _format_vector(embedding) if embedding else None
+        await conn.execute(
+            f"""
+            INSERT INTO {self._nodes}
+                (id, node_type, content, embedding, utility_score,
+                 access_count, created_at, last_accessed, metadata,
+                 valid_from, valid_until)
+            VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
+                    $10::timestamptz, $11::timestamptz)
+            ON CONFLICT (id) DO UPDATE SET
+                node_type = EXCLUDED.node_type,
+                content = EXCLUDED.content,
+                embedding = EXCLUDED.embedding,
+                utility_score = EXCLUDED.utility_score,
+                access_count = EXCLUDED.access_count,
+                last_accessed = EXCLUDED.last_accessed,
+                metadata = EXCLUDED.metadata,
+                valid_from = EXCLUDED.valid_from,
+                valid_until = EXCLUDED.valid_until
+            """,
+            node["id"],
+            node["node_type"],
+            node["content"],
+            embedding_str,
+            float(node.get("utility_score", 1.0)),
+            int(node.get("access_count", 0)),
+            _coerce_timestamp(node.get("created_at")),
+            _coerce_timestamp(node.get("last_accessed")),
+            json.dumps(node.get("metadata", {})),
+            _coerce_timestamp_optional(node.get("valid_from")),
+            _coerce_timestamp_optional(node.get("valid_until")),
+        )
 
+    async def save_node(self, node: dict[str, Any]) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {self._nodes}
-                    (id, node_type, content, embedding, utility_score,
-                     access_count, created_at, last_accessed, metadata)
-                VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb)
-                ON CONFLICT (id) DO UPDATE SET
-                    node_type = EXCLUDED.node_type,
-                    content = EXCLUDED.content,
-                    embedding = EXCLUDED.embedding,
-                    utility_score = EXCLUDED.utility_score,
-                    access_count = EXCLUDED.access_count,
-                    last_accessed = EXCLUDED.last_accessed,
-                    metadata = EXCLUDED.metadata
-                """,
-                node["id"],
-                node["node_type"],
-                node["content"],
-                embedding_str,
-                float(node.get("utility_score", 1.0)),
-                int(node.get("access_count", 0)),
-                _coerce_timestamp(node.get("created_at")),
-                _coerce_timestamp(node.get("last_accessed")),
-                json.dumps(node.get("metadata", {})),
-            )
+            await self._write_node(conn, node)
 
     async def load_node(self, node_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
@@ -137,7 +163,8 @@ class PostgresBackend:
                 f"""
                 SELECT id, node_type, content, embedding::text,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata
+                       created_at::text, last_accessed::text, metadata,
+                       valid_from::text, valid_until::text
                 FROM {self._nodes} WHERE id = $1
                 """,
                 node_id,
@@ -148,26 +175,41 @@ class PostgresBackend:
 
     # --- Edge operations ---
 
+    async def _write_edge(self, conn: asyncpg.Connection, edge: dict[str, Any]) -> None:
+        """Upsert one edge on the given connection (for save_edge and batches)."""
+        await conn.execute(
+            f"""
+            INSERT INTO {self._edges}
+                (id, source_id, target_id, relation_type, weight, created_at, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb)
+            ON CONFLICT (id) DO UPDATE SET
+                relation_type = EXCLUDED.relation_type,
+                weight = EXCLUDED.weight,
+                metadata = EXCLUDED.metadata
+            """,
+            edge["id"],
+            edge["source_id"],
+            edge["target_id"],
+            edge["relation_type"],
+            float(edge.get("weight", 1.0)),
+            _coerce_timestamp(edge.get("created_at")),
+            json.dumps(edge.get("metadata", {})),
+        )
+
     async def save_edge(self, edge: dict[str, Any]) -> None:
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"""
-                INSERT INTO {self._edges}
-                    (id, source_id, target_id, relation_type, weight, created_at, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb)
-                ON CONFLICT (id) DO UPDATE SET
-                    relation_type = EXCLUDED.relation_type,
-                    weight = EXCLUDED.weight,
-                    metadata = EXCLUDED.metadata
-                """,
-                edge["id"],
-                edge["source_id"],
-                edge["target_id"],
-                edge["relation_type"],
-                float(edge.get("weight", 1.0)),
-                _coerce_timestamp(edge.get("created_at")),
-                json.dumps(edge.get("metadata", {})),
-            )
+            await self._write_edge(conn, edge)
+
+    async def write_batch(
+        self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+    ) -> None:
+        """Write nodes then edges atomically in one transaction; rolls back on error."""
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                for node in nodes:
+                    await self._write_node(conn, node)
+                for edge in edges:
+                    await self._write_edge(conn, edge)
 
     async def load_edges(
         self, node_id: str, edge_type: str | None = None
@@ -228,7 +270,8 @@ class PostgresBackend:
                 f"""
                 SELECT id, node_type, content, embedding::text,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata
+                       created_at::text, last_accessed::text, metadata,
+                       valid_from::text, valid_until::text
                 FROM {self._nodes}
                 WHERE {where}
                 ORDER BY utility_score DESC
@@ -271,6 +314,18 @@ class PostgresBackend:
                 f"DELETE FROM {self._nodes} WHERE id = $1", node_id
             )
 
+    async def delete_nodes_batch(self, node_ids: list[str]) -> None:
+        """Delete multiple nodes (edges cascade) atomically in one statement.
+
+        Used to evict a whole episode all-or-nothing.
+        """
+        if not node_ids:
+            return
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                f"DELETE FROM {self._nodes} WHERE id = ANY($1::text[])", node_ids
+            )
+
     async def delete_edge(self, edge_id: str) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
@@ -293,6 +348,7 @@ class PostgresBackend:
                     SELECT id, node_type, content, embedding::text,
                            utility_score, access_count,
                            created_at::text, last_accessed::text, metadata,
+                           valid_from::text, valid_until::text,
                            1 - (embedding <=> $1::vector) AS similarity
                     FROM {self._nodes}
                     WHERE node_type = $2 AND embedding IS NOT NULL
@@ -307,6 +363,7 @@ class PostgresBackend:
                     SELECT id, node_type, content, embedding::text,
                            utility_score, access_count,
                            created_at::text, last_accessed::text, metadata,
+                           valid_from::text, valid_until::text,
                            1 - (embedding <=> $1::vector) AS similarity
                     FROM {self._nodes}
                     WHERE embedding IS NOT NULL
@@ -368,7 +425,8 @@ class PostgresBackend:
                 SELECT DISTINCT ON (n.id)
                     n.id, n.node_type, n.content, n.embedding::text,
                     n.utility_score, n.access_count,
-                    n.created_at::text, n.last_accessed::text, n.metadata
+                    n.created_at::text, n.last_accessed::text, n.metadata,
+                    n.valid_from::text, n.valid_until::text
                 FROM traversal t
                 JOIN {self._nodes} n ON n.id = t.node_id
                 LIMIT $3
@@ -411,6 +469,8 @@ def _row_to_node(row: asyncpg.Record) -> dict[str, Any]:
         "created_at": row["created_at"],
         "last_accessed": row["last_accessed"],
         "metadata": meta if isinstance(meta, dict) else {},
+        "valid_from": row["valid_from"] if "valid_from" in row.keys() else None,
+        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
     }
 
 

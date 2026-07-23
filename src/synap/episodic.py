@@ -62,8 +62,6 @@ class EpisodicMemory:
                 "input_data": episode.input_data,
             },
         )
-        await self._graph.add_node(cue_node)
-
         content_parts = [json.dumps(episode.content, default=str)]
         if episode.tool_calls:
             tool_lines = []
@@ -98,8 +96,6 @@ class EpisodicMemory:
                 ],
             },
         )
-        await self._graph.add_node(content_node)
-
         outcome_str = episode.outcome.value
         if episode.correction:
             outcome_str += f" | correction: {episode.correction}"
@@ -114,25 +110,20 @@ class EpisodicMemory:
                 "correction": episode.correction,
             },
         )
-        await self._graph.add_node(outcome_node)
-
-        await self._graph.add_edge(
+        edges = [
             MemoryEdge(
                 source_id=cue_node.id,
                 target_id=content_node.id,
                 relation_type="produced",
-            )
-        )
-        await self._graph.add_edge(
+            ),
             MemoryEdge(
                 source_id=content_node.id,
                 target_id=outcome_node.id,
                 relation_type="resulted_in",
-            )
-        )
-
+            ),
+        ]
         if episode.outcome == EpisodeOutcome.CORRECTED and episode.correction:
-            await self._graph.add_edge(
+            edges.append(
                 MemoryEdge(
                     source_id=outcome_node.id,
                     target_id=cue_node.id,
@@ -141,6 +132,10 @@ class EpisodicMemory:
                 )
             )
 
+        # One atomic write — a mid-write failure must not leave a sheared episode.
+        await self._graph.write_batch(
+            [cue_node, content_node, outcome_node], edges
+        )
         self._episodes[episode.id] = episode
         return episode.id
 
