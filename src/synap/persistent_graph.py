@@ -4,25 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import math
 from datetime import datetime, timezone
 from typing import Any
 
-from synap._utils import select_evictions
+from synap._utils import compute_decay_score, select_evictions
 from synap.protocols import AsyncStorageBackend, StorageBackend
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
-
-def compute_decay_score(
-    hours_since_access: float,
-    access_count: int,
-    decay_rate: float = 0.01,
-) -> float:
-    """Canonical decay formula — must stay in sync with KuzuBackend.decay_all_scores Cypher."""
-    hours = max(1.0 / 3600, hours_since_access)
-    decay = math.pow(1 - decay_rate, hours)
-    frequency_bonus = min(1.0, access_count / 20)
-    return decay + frequency_bonus
+# Re-exported for callers that import it from here; canonical home is synap._utils.
+__all__ = ["PersistentGraph", "compute_decay_score"]
 
 
 def _node_to_dict(node: MemoryNode) -> dict[str, Any]:
@@ -242,10 +232,10 @@ class PersistentGraph:
         if d is None:
             return
         node = _dict_to_node(d)
-        node.touch()
+        node.touch()  # sets last_accessed = now
         seconds = max(
             1.0,
-            (datetime.now(timezone.utc) - node.created_at).total_seconds(),
+            (datetime.now(timezone.utc) - node.last_accessed).total_seconds(),
         )
         node.utility_score = compute_decay_score(
             seconds / 3600, node.access_count, self._utility_decay_rate

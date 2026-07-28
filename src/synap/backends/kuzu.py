@@ -338,7 +338,9 @@ class KuzuBackend:
         """Recompute utility_score for all nodes in a single Cypher SET.
 
         Runs entirely server-side — no node data leaves the DB.
-        Formula mirrors ``persistent_graph.compute_decay_score``.
+        Formula mirrors ``synap._utils.compute_decay_score``: recency
+        (``pow(1 - rate, hours)``) multiplied by ``1 + frequency_bonus`` so a
+        cold node scores ~0 regardless of how often it was accessed.
         """
         self._conn().execute(
             """
@@ -352,9 +354,9 @@ class KuzuBackend:
                       ELSE hours_raw END AS hours
             SET n.utility_score =
                 pow(1.0 - $rate, hours)
-                + CASE WHEN cast(n.access_count AS DOUBLE) / 20.0 < 1.0
-                       THEN cast(n.access_count AS DOUBLE) / 20.0
-                       ELSE 1.0 END
+                * (1.0 + CASE WHEN cast(n.access_count AS DOUBLE) / 20.0 < 1.0
+                              THEN cast(n.access_count AS DOUBLE) / 20.0
+                              ELSE 1.0 END)
             """,
             parameters={
                 "now_ms": now_epoch_ms,

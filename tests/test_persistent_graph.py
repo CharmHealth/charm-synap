@@ -211,7 +211,7 @@ def test_decay_formula_sync():
     from synap.persistent_graph import compute_decay_score
 
     cases = [
-        # (hours, access_count, rate, expected_decay, expected_freq)
+        # (hours, access_count, rate)
         (0.0, 0, 0.01),      # near-zero hours (clamped), zero access
         (1.0, 10, 0.01),     # 1 hour, moderate access
         (24.0, 20, 0.01),    # 1 day, saturated frequency
@@ -222,7 +222,8 @@ def test_decay_formula_sync():
     for hours, count, rate in cases:
         result = compute_decay_score(hours, count, rate)
         h = max(1.0 / 3600, hours)
-        expected = math.pow(1 - rate, h) + min(1.0, count / 20)
+        # recency gates frequency: r * (1 + f), not r + f
+        expected = math.pow(1 - rate, h) * (1 + min(1.0, count / 20))
         assert abs(result - expected) < 1e-12, (
             f"hours={hours}, count={count}: got {result}, expected {expected}"
         )

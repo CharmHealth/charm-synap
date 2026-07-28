@@ -109,13 +109,14 @@ All triggers produce a `ConsolidationEvent`. The consolidation engine processes 
 
 ### Lifecycle
 
-Every node has a `utility_score` that combines recency, access frequency, and consolidation status:
+Every node has a `utility_score` that combines recency and access frequency, with recency gating frequency:
 
 ```
-utility = base * (1 - decay_rate)^hours + frequency_bonus
+utility = (1 - decay_rate)^hours_since_last_access * (1 + frequency_bonus)
+frequency_bonus = min(1, access_count / 20)
 ```
 
-Frequently accessed nodes resist decay. Consolidated nodes get a utility boost. Stale nodes fade and eventually get evicted.
+Recency *multiplies*, so a node that goes cold decays toward zero no matter how often it was accessed — frequency stretches the forgetting horizon (up to 2x) but never grants immortality. `hours_since_last_access` is measured from `last_accessed`, not creation, so accessing a node refreshes it. Stale nodes fade and eventually get evicted.
 
 ### Versioning
 

@@ -3,7 +3,36 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
+
+
+def compute_decay_score(
+    hours_since_access: float,
+    access_count: int,
+    decay_rate: float = 0.01,
+) -> float:
+    """Canonical utility score: recency gates frequency.
+
+    ``score = r * (1 + f)`` where recency ``r = (1 - decay_rate) ** hours``
+    decays toward 0 as a node goes cold, and the frequency proxy
+    ``f = min(1, access_count / 20)`` boosts a node by up to 2x. Because recency
+    *multiplies*, a cold node scores ~0 no matter how often it was used (no
+    immortality floor); because ``f`` is floored at 0 (so the factor is >= 1), a
+    fresh-but-rarely-used node still survives on recency alone.
+
+    ``hours_since_access`` must be measured from ``last_accessed`` — recency, not
+    age from creation.
+
+    The ``/20`` divisor and the cap at ``f = 1`` are untuned inherited constants;
+    the invariants above fix the structure, not the scale. Tuning them needs
+    workload telemetry (CH-728). The Kuzu ``decay_all_scores`` Cypher is a
+    server-side copy of this formula and must be kept in sync.
+    """
+    hours = max(1.0 / 3600, hours_since_access)
+    decay = math.pow(1 - decay_rate, hours)
+    frequency_bonus = min(1.0, access_count / 20)
+    return decay * (1 + frequency_bonus)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:

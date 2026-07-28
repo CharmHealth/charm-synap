@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from synap._utils import cosine_similarity, select_evictions
+from synap._utils import compute_decay_score, cosine_similarity, select_evictions
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 
@@ -208,24 +207,22 @@ class MemoryGraph:
         node = self._nodes.get(node_id)
         if node is None:
             return
-        node.touch()
-        seconds_since_creation = max(
+        node.touch()  # sets last_accessed = now
+        seconds = max(
             1.0,
-            (datetime.now(timezone.utc) - node.created_at).total_seconds(),
+            (datetime.now(timezone.utc) - node.last_accessed).total_seconds(),
         )
-        hours = seconds_since_creation / 3600
-        decay = math.pow(1 - self._utility_decay_rate, hours)
-        frequency_bonus = min(1.0, node.access_count / 20)
-        node.utility_score = decay + frequency_bonus
+        node.utility_score = compute_decay_score(
+            seconds / 3600, node.access_count, self._utility_decay_rate
+        )
 
     async def decay_all(self) -> None:
         now = datetime.now(timezone.utc)
         for node in self._nodes.values():
             seconds = max(1.0, (now - node.last_accessed).total_seconds())
-            hours = seconds / 3600
-            decay = math.pow(1 - self._utility_decay_rate, hours)
-            frequency_bonus = min(1.0, node.access_count / 20)
-            node.utility_score = decay + frequency_bonus
+            node.utility_score = compute_decay_score(
+                seconds / 3600, node.access_count, self._utility_decay_rate
+            )
 
     async def evict(self, threshold: float = 0.1) -> list[str]:
         items = [
