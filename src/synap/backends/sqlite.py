@@ -2,12 +2,35 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Any
 
 from synap._utils import cosine_similarity
+
+
+def _synchronized(method):
+    """Serialize a public backend method on the instance lock.
+
+    PersistentGraph dispatches sync backends via ``asyncio.to_thread``, so calls
+    arrive on arbitrary worker threads. The connection is opened with
+    ``check_same_thread=False`` — safe because sqlite3 runs in serialized mode
+    (threadsafety == 3) — and this lock keeps multi-statement transactions
+    (write_batch, delete_nodes_batch) from being interleaved by a concurrent
+    call, and reads from seeing another call's uncommitted rows on the shared
+    connection. The lock is reentrant so a read method may call another
+    (traverse -> load_edges/load_node) without deadlocking.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class SQLiteBackend:
@@ -21,7 +44,10 @@ class SQLiteBackend:
 
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
-        self._conn = sqlite3.connect(self._path)
+        # Reentrant so read methods can nest (traverse -> load_*); guards the
+        # single connection shared across executor threads (see _synchronized).
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -88,6 +114,7 @@ class SQLiteBackend:
             ),
         )
 
+    @_synchronized
     def save_node(self, node: dict[str, Any]) -> None:
         self._write_node_row(node)
         self._conn.commit()
@@ -111,10 +138,12 @@ class SQLiteBackend:
             ),
         )
 
+    @_synchronized
     def save_edge(self, edge: dict[str, Any]) -> None:
         self._write_edge_row(edge)
         self._conn.commit()
 
+    @_synchronized
     def write_batch(
         self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
     ) -> None:
@@ -129,6 +158,7 @@ class SQLiteBackend:
             self._conn.rollback()
             raise
 
+    @_synchronized
     def load_node(self, node_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT data FROM nodes WHERE id = ?", (node_id,)
@@ -137,6 +167,7 @@ class SQLiteBackend:
             return None
         return json.loads(row["data"])
 
+    @_synchronized
     def load_edges(
         self, node_id: str, edge_type: str | None = None
     ) -> list[dict[str, Any]]:
@@ -153,6 +184,7 @@ class SQLiteBackend:
             ).fetchall()
         return [json.loads(r["data"]) for r in rows]
 
+    @_synchronized
     def query_nodes(
         self,
         node_type: str | None = None,
@@ -190,6 +222,7 @@ class SQLiteBackend:
                 results.append(data)
         return results
 
+    @_synchronized
     def node_count(self, node_type: str | None = None) -> int:
         if node_type:
             row = self._conn.execute(
@@ -199,6 +232,7 @@ class SQLiteBackend:
             row = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
         return row[0]
 
+    @_synchronized
     def edge_count(self, relation_type: str | None = None) -> int:
         if relation_type:
             row = self._conn.execute(
@@ -217,10 +251,12 @@ class SQLiteBackend:
         )
         self._conn.execute("DELETE FROM nodes WHERE id = ?", (node_id,))
 
+    @_synchronized
     def delete_node(self, node_id: str) -> None:
         self._delete_node_rows(node_id)
         self._conn.commit()
 
+    @_synchronized
     def delete_nodes_batch(self, node_ids: list[str]) -> None:
         """Delete multiple nodes (and their edges) atomically, one commit."""
         try:
@@ -231,10 +267,12 @@ class SQLiteBackend:
             self._conn.rollback()
             raise
 
+    @_synchronized
     def delete_edge(self, edge_id: str) -> None:
         self._conn.execute("DELETE FROM edges WHERE id = ?", (edge_id,))
         self._conn.commit()
 
+    @_synchronized
     def similarity_search(
         self,
         embedding: list[float],
@@ -266,6 +304,7 @@ class SQLiteBackend:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [data for _, data in scored[:limit]]
 
+    @_synchronized
     def traverse(
         self,
         start_id: str,
@@ -302,6 +341,7 @@ class SQLiteBackend:
 
         return results
 
+    @_synchronized
     def close(self) -> None:
         self._conn.close()
 
