@@ -47,22 +47,31 @@ class ProceduralMemory:
                 "episode_ids": procedure.episode_ids,
             },
         )
-        await self._graph.add_node(node)
-
-        self._procedures[procedure.id] = procedure
-        self._task_type_index[procedure.task_type] = procedure.id
-
+        nodes = [node]
+        edges: list[MemoryEdge] = []
         if existing_id and existing_id != procedure.id:
-            try:
-                await self._graph.add_edge(
+            old_node = await self._graph.get_node(existing_id)
+            if old_node is not None:
+                # Tombstone the retired version intrinsically (status), and keep
+                # the supersedes edge for lineage. Status reads consult the flag,
+                # never the edge, so deleting this new version cannot resurrect
+                # the old one.
+                old_node.metadata = {**old_node.metadata, "superseded": True}
+                nodes.append(old_node)
+                edges.append(
                     MemoryEdge(
                         source_id=procedure.id,
                         target_id=existing_id,
                         relation_type="supersedes",
                     )
                 )
-            except KeyError:
-                pass
+
+        # One atomic write: the new version, the retired flag on the old version,
+        # and the lineage edge land together or not at all.
+        await self._graph.write_batch(nodes, edges)
+
+        self._procedures[procedure.id] = procedure
+        self._task_type_index[procedure.task_type] = procedure.id
 
         return procedure.id
 
@@ -83,7 +92,7 @@ class ProceduralMemory:
             )
             for node in nodes:
                 proc = await self._reconstruct_procedure(node)
-                if proc and await self._is_active(proc.id):
+                if proc and await self._is_active(node):
                     return proc
 
         # Structural match: task_type substring in description
@@ -94,7 +103,7 @@ class ProceduralMemory:
             node_task_type = node.metadata.get("task_type", "")
             if node_task_type and node_task_type in task_description:
                 proc = await self._reconstruct_procedure(node)
-                if proc and await self._is_active(proc.id):
+                if proc and await self._is_active(node):
                     return proc
 
         # Fallback: similarity search
@@ -105,7 +114,7 @@ class ProceduralMemory:
 
         for node in similar:
             proc = await self._reconstruct_procedure(node)
-            if proc and await self._is_active(proc.id):
+            if proc and await self._is_active(node):
                 return proc
 
         return None
@@ -155,7 +164,7 @@ class ProceduralMemory:
             proc = await self._reconstruct_procedure(node)
             if proc is None:
                 continue
-            if active_only and not await self._is_active(proc.id):
+            if active_only and not await self._is_active(node):
                 continue
             procedures.append(proc)
         return procedures
@@ -186,8 +195,11 @@ class ProceduralMemory:
         self._task_type_index[task_type] = node.id
         return procedure
 
-    async def _is_active(self, procedure_id: str) -> bool:
-        return not await self._graph.has_incoming_edge(procedure_id, "supersedes")
+    async def _is_active(self, node: MemoryNode) -> bool:
+        """Active unless intrinsically tombstoned. Reads the `superseded` flag,
+        never the supersedes edge, so deletion of a superseder can't reactivate
+        a retired version."""
+        return not node.metadata.get("superseded", False)
 
     def _corrective_hints(self, episodes: list[MemoryNode]) -> str:
         """Extract correction text from failure/corrected outcome nodes."""
