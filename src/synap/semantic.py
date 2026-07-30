@@ -8,7 +8,7 @@ directly.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -105,10 +105,10 @@ class SemanticMemory:
         now = datetime.now(timezone.utc)
         embedding = await self._embedder.embed(content)
 
-        # Detect contradictions before adding the new node
-        superseded_ids: list[str] = []
+        # Detect which existing facts the new one supersedes (no side effects).
+        to_expire: list[MemoryNode] = []
         if check_contradictions and self._llm:
-            superseded_ids = await self._detect_contradictions(content, embedding, now)
+            to_expire = await self._detect_contradictions(content, embedding, now)
 
         node = MemoryNode(
             content=content,
@@ -117,20 +117,22 @@ class SemanticMemory:
             metadata=metadata or {},
             valid_from=now,
         )
-        await self._graph.add_node(node)
 
-        # Create supersedes edges from new node to old nodes
-        for old_id in superseded_ids:
-            try:
-                await self._graph.add_edge(
-                    MemoryEdge(
-                        source_id=node.id,
-                        target_id=old_id,
-                        relation_type="supersedes",
-                    )
-                )
-            except KeyError:
-                pass
+        # Retire superseded facts by writing copies with valid_until set (not by
+        # mutating the stored nodes, so a failed write rolls back cleanly), and
+        # record lineage with supersedes edges. The new fact, the retired copies,
+        # and the edges are one atomic write — a fact is never expired without a
+        # replacement in place.
+        expired = [replace(old, valid_until=now) for old in to_expire]
+        supersedes_edges = [
+            MemoryEdge(
+                source_id=node.id,
+                target_id=old.id,
+                relation_type="supersedes",
+            )
+            for old in to_expire
+        ]
+        await self._graph.write_batch([node, *expired], supersedes_edges)
 
         if relations:
             for source_id, relation_type, target_id in relations:
@@ -241,9 +243,9 @@ class SemanticMemory:
     # --- Temporal validity ---
 
     async def _is_current(self, node: MemoryNode, as_of: datetime) -> bool:
-        """Check if a node is currently valid (not superseded, not expired)."""
-        if await self._graph.has_incoming_edge(node.id, "supersedes"):
-            return False
+        """Current unless retired or expired. Retirement is recorded intrinsically
+        as valid_until (set when the fact is superseded), never read from the
+        supersedes edge — so deleting a superseder cannot revive the old fact."""
         if node.valid_until and node.valid_until < as_of:
             return False
         return True
@@ -253,18 +255,17 @@ class SemanticMemory:
         new_content: str,
         new_embedding: list[float],
         now: datetime,
-    ) -> list[str]:
-        """Find existing facts that the new fact contradicts. Returns their IDs."""
+    ) -> list[MemoryNode]:
+        """Find existing facts the new one supersedes. Pure — returns the nodes
+        to retire; the caller expires them atomically with the new fact."""
         similar = await self._graph.similarity_search(
             new_embedding, node_type=MemoryType.SEMANTIC, limit=5
         )
 
-        superseded: list[str] = []
+        to_expire: list[MemoryNode] = []
         for existing in similar:
-            # Skip already-superseded nodes
-            if await self._graph.has_incoming_edge(existing.id, "supersedes"):
-                continue
-            # Skip expired nodes
+            # Skip already-retired/expired facts. Retirement is recorded on the
+            # node as valid_until, not inferred from the supersedes edge.
             if existing.valid_until and existing.valid_until < now:
                 continue
 
@@ -276,8 +277,6 @@ class SemanticMemory:
             verdict = response.strip().upper()
 
             if "SUPERSEDES" in verdict:
-                existing.valid_until = now
-                await self._graph.add_node(existing)  # update via upsert
-                superseded.append(existing.id)
+                to_expire.append(existing)
 
-        return superseded
+        return to_expire
