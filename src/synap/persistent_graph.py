@@ -7,7 +7,11 @@ import inspect
 from datetime import datetime, timezone
 from typing import Any
 
-from synap._utils import compute_decay_score, select_evictions
+from synap._utils import (
+    compute_decay_score,
+    is_eviction_protected,
+    select_evictions,
+)
 from synap.protocols import AsyncStorageBackend, StorageBackend
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
@@ -287,6 +291,7 @@ class PersistentGraph:
                 (d.get("metadata") or {}).get("episode_id"),
             )
             for d in all_nodes
+            if not is_eviction_protected(d["node_type"], d.get("metadata"))
         ]
         to_evict = select_evictions(items, threshold)
         if to_evict:

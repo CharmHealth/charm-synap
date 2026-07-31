@@ -6,7 +6,12 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any
 
-from synap._utils import compute_decay_score, cosine_similarity, select_evictions
+from synap._utils import (
+    compute_decay_score,
+    cosine_similarity,
+    is_eviction_protected,
+    select_evictions,
+)
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 
@@ -228,6 +233,7 @@ class MemoryGraph:
         items = [
             (nid, node.utility_score, (node.metadata or {}).get("episode_id"))
             for nid, node in self._nodes.items()
+            if not is_eviction_protected(node.node_type.value, node.metadata)
         ]
         to_evict = select_evictions(items, threshold)
         for nid in to_evict:

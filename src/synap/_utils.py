@@ -6,6 +6,22 @@ import json
 import math
 from typing import Any
 
+from synap.types import MemoryType
+
+
+def is_eviction_protected(node_type: str, metadata: dict[str, Any] | None) -> bool:
+    """Whether a node is exempt from utility-based eviction (CH-728 item 4).
+
+    An active procedure is a durable capability — expensive to relearn and
+    naturally bounded (one active per task_type) — so it is never evicted while
+    active. A retired (superseded) procedure and every other node type evict
+    normally. Retirement is read from the intrinsic `superseded` flag, never the
+    supersedes edge.
+    """
+    if node_type != MemoryType.PROCEDURAL.value:
+        return False
+    return not (metadata or {}).get("superseded", False)
+
 
 def compute_decay_score(
     hours_since_access: float,
