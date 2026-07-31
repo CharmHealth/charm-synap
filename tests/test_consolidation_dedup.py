@@ -8,7 +8,9 @@ tool), never the episode count, so it survives the pattern growing.
 
 from __future__ import annotations
 
-from synap.consolidation import ConsolidationEngine
+from datetime import datetime, timezone
+
+from synap.consolidation import ConsolidationEngine, _consolidated_fact_id
 from synap.episodic import EpisodicMemory
 from synap.graph import MemoryGraph
 from synap.procedural import ProceduralMemory
@@ -85,3 +87,31 @@ async def test_growing_pattern_stays_one_fact():
 
     count = await graph.node_count(MemoryType.SEMANTIC)
     assert count == 1, f"growing pattern duplicated the fact: {count} facts"
+
+
+async def test_reconsolidation_does_not_resurrect_a_retired_fact():
+    """If a consolidated fact was superseded (valid_until set) after it was made,
+    re-consolidating its pattern must NOT clear that retirement or reset its
+    lifecycle — the upsert is a content refresh, not a rebirth."""
+    graph = MemoryGraph()
+    engine = _engine(graph)
+    candidates = [_episode_content(f"e{i}") for i in range(3)]
+    for c in candidates:
+        await graph.add_node(c)
+    await engine.process(_success_event(candidates))
+
+    fid = _consolidated_fact_id({"task_type": "billing", "pattern_key": "outcome:success"})
+    fact = await graph.get_node(fid)
+    assert fact is not None
+    # Externally retire it (as a newer contradicting fact would), and give it a
+    # lived-in lifecycle.
+    fact.valid_until = datetime.now(timezone.utc)
+    fact.access_count = 99
+    fact.utility_score = 0.05
+    await graph.add_node(fact)
+
+    await engine.process(_success_event(candidates))  # same pattern re-consolidates
+
+    after = await graph.get_node(fid)
+    assert after.valid_until is not None, "re-consolidation resurrected a retired fact"
+    assert after.access_count == 99, "re-consolidation reset the fact's lifecycle"

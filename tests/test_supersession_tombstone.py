@@ -159,3 +159,30 @@ async def test_procedural_register_supersession_is_atomic():
 
     old = await graph.get_node(v1.id)
     assert old.metadata.get("superseded") is not True, "retired flag survived rollback"
+
+
+async def test_procedural_tombstone_persists_and_survives_over_kuzu(tmp_path):
+    """The tombstone + atomic write_batch supersession works over a real backend,
+    not just MemoryGraph: the flag round-trips and deleting the superseder does
+    not resurrect the retired version."""
+    from synap.backends.kuzu import KuzuBackend
+    from synap.persistent_graph import PersistentGraph
+
+    backend = KuzuBackend(tmp_path / "g", embedding_dim=8)  # FakeEmbedder -> 8 dims
+    graph = PersistentGraph(backend=backend)
+    try:
+        proc = ProceduralMemory(graph, FakeEmbedder())
+        v1 = _proc("classify", "Classify v1", ["evidence", "classification"])
+        v2 = _proc("classify", "Classify v2", ["evidence_for", "classification"])
+        await proc.register(v1)
+        await proc.register(v2)
+
+        old = await graph.get_node(v1.id)
+        assert old.metadata.get("superseded") is True, "flag did not round-trip"
+        assert (await proc.match("classify")).id == v2.id
+
+        await graph.remove_node(v2.id)  # delete the superseder
+        matched = await proc.match("classify")
+        assert matched is None or matched.id != v1.id, "resurrected over Kuzu"
+    finally:
+        backend.close()

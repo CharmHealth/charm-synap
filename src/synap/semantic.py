@@ -107,15 +107,19 @@ class SemanticMemory:
         now = datetime.now(timezone.utc)
         embedding = await self._embedder.embed(content)
 
-        # Detect which existing facts the new one supersedes (no side effects).
-        # Exclude node_id so an idempotent re-write (a consolidated fact keyed on
-        # its pattern) doesn't detect its own prior version as a contradiction
-        # and self-supersede.
+        # A deterministic-id write whose target already exists is an idempotent
+        # content refresh (e.g. a re-consolidated fact), not a new fact. Skip
+        # contradiction detection — it ran when the fact was first created;
+        # re-running it would re-supersede other facts and spray duplicate
+        # edges — and carry the existing node's lifecycle forward, so a refresh
+        # never resurrects a retired fact or resets its age/usage.
+        existing = (
+            await self._graph.get_node(node_id) if node_id is not None else None
+        )
+
         to_expire: list[MemoryNode] = []
-        if check_contradictions and self._llm:
-            to_expire = await self._detect_contradictions(
-                content, embedding, now, exclude_id=node_id
-            )
+        if existing is None and check_contradictions and self._llm:
+            to_expire = await self._detect_contradictions(content, embedding, now)
 
         node = MemoryNode(
             content=content,
@@ -126,6 +130,13 @@ class SemanticMemory:
         )
         if node_id is not None:
             node.id = node_id
+        if existing is not None:
+            node.valid_from = existing.valid_from
+            node.valid_until = existing.valid_until
+            node.created_at = existing.created_at
+            node.last_accessed = existing.last_accessed
+            node.utility_score = existing.utility_score
+            node.access_count = existing.access_count
 
         # Retire superseded facts by writing copies with valid_until set (not by
         # mutating the stored nodes, so a failed write rolls back cleanly), and
@@ -264,19 +275,19 @@ class SemanticMemory:
         new_content: str,
         new_embedding: list[float],
         now: datetime,
-        exclude_id: str | None = None,
     ) -> list[MemoryNode]:
         """Find existing facts the new one supersedes. Pure — returns the nodes
-        to retire; the caller expires them atomically with the new fact."""
+        to retire; the caller expires them atomically with the new fact.
+
+        Only ever called for a genuinely new fact (store skips it on an
+        idempotent refresh), so the node being written is never in the graph yet
+        and can't be found as its own contradiction."""
         similar = await self._graph.similarity_search(
             new_embedding, node_type=MemoryType.SEMANTIC, limit=5
         )
 
         to_expire: list[MemoryNode] = []
         for existing in similar:
-            # Never treat the node being (re)written as its own contradiction.
-            if exclude_id is not None and existing.id == exclude_id:
-                continue
             # Skip already-retired/expired facts. Retirement is recorded on the
             # node as valid_until, not inferred from the supersedes edge.
             if existing.valid_until and existing.valid_until < now:
