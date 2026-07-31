@@ -143,3 +143,19 @@ async def test_semantic_supersession_is_atomic_on_write_failure():
     v1 = await graph.get_node(v1_id)
     assert v1.valid_until is None, "old fact expired despite the write failing"
     assert await sem._is_current(v1, _now())
+
+
+async def test_procedural_register_supersession_is_atomic():
+    """If the supersession write fails, the old procedure must not be left
+    flagged superseded — the retired flag rolls back with the rest."""
+    graph = _SupersessionWriteFails()
+    proc = ProceduralMemory(graph, FakeEmbedder())
+    v1 = _proc("classify", "Classify v1", ["evidence", "classification"])
+    await proc.register(v1)  # plain register, one node
+
+    v2 = _proc("classify", "Classify v2", ["evidence_for", "classification"])
+    with pytest.raises(RuntimeError):
+        await proc.register(v2)  # supersession -> multi-node write -> fails
+
+    old = await graph.get_node(v1.id)
+    assert old.metadata.get("superseded") is not True, "retired flag survived rollback"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from synap.protocols import EmbeddingProvider, GraphStore
@@ -55,9 +56,12 @@ class ProceduralMemory:
                 # Tombstone the retired version intrinsically (status), and keep
                 # the supersedes edge for lineage. Status reads consult the flag,
                 # never the edge, so deleting this new version cannot resurrect
-                # the old one.
-                old_node.metadata = {**old_node.metadata, "superseded": True}
-                nodes.append(old_node)
+                # the old one. Write a copy (not the stored node) so a failed
+                # write_batch rolls back cleanly instead of leaving the flag set.
+                retired = replace(
+                    old_node, metadata={**old_node.metadata, "superseded": True}
+                )
+                nodes.append(retired)
                 edges.append(
                     MemoryEdge(
                         source_id=procedure.id,
