@@ -28,6 +28,10 @@ class EpisodicPattern:
     occurrences: int
     episode_ids: list[str]
     outcome: EpisodeOutcome
+    # Stable identity of the pattern, independent of how many episodes it spans.
+    # `pattern_description` embeds the count and is for display only; `key` is
+    # what consolidation dedups on. Empty string only for legacy construction.
+    key: str = ""
 
 
 class EpisodicMemory:
@@ -250,6 +254,7 @@ class EpisodicMemory:
                         occurrences=len(eps),
                         episode_ids=[e.id for e in eps],
                         outcome=outcome,
+                        key=f"outcome:{outcome.value}",
                     )
                 )
 
@@ -271,6 +276,7 @@ class EpisodicMemory:
                         occurrences=len(unique_eps),
                         episode_ids=[e.id for e in unique_eps],
                         outcome=EpisodeOutcome.FAILURE,
+                        key=f"tool:{tool_name}",
                     )
                 )
 

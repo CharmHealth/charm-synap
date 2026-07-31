@@ -85,13 +85,14 @@ class SemanticMemory:
         insights: list[str],
         source_episodes: list[MemoryNode],
         metadata: dict[str, Any] | None = None,
+        node_id: str | None = None,
     ) -> str | None:
         if not insights:
             return None
         combined = " ".join(insights)
         meta = dict(metadata or {})
         meta["consolidated_from"] = [ep.id for ep in source_episodes]
-        return await self.store(content=combined, metadata=meta)
+        return await self.store(content=combined, metadata=meta, node_id=node_id)
 
     # --- Direct graph operations ---
 
@@ -101,14 +102,20 @@ class SemanticMemory:
         relations: list[tuple[str, str, str]] | None = None,
         metadata: dict[str, Any] | None = None,
         check_contradictions: bool = True,
+        node_id: str | None = None,
     ) -> str:
         now = datetime.now(timezone.utc)
         embedding = await self._embedder.embed(content)
 
         # Detect which existing facts the new one supersedes (no side effects).
+        # Exclude node_id so an idempotent re-write (a consolidated fact keyed on
+        # its pattern) doesn't detect its own prior version as a contradiction
+        # and self-supersede.
         to_expire: list[MemoryNode] = []
         if check_contradictions and self._llm:
-            to_expire = await self._detect_contradictions(content, embedding, now)
+            to_expire = await self._detect_contradictions(
+                content, embedding, now, exclude_id=node_id
+            )
 
         node = MemoryNode(
             content=content,
@@ -117,6 +124,8 @@ class SemanticMemory:
             metadata=metadata or {},
             valid_from=now,
         )
+        if node_id is not None:
+            node.id = node_id
 
         # Retire superseded facts by writing copies with valid_until set (not by
         # mutating the stored nodes, so a failed write rolls back cleanly), and
@@ -255,6 +264,7 @@ class SemanticMemory:
         new_content: str,
         new_embedding: list[float],
         now: datetime,
+        exclude_id: str | None = None,
     ) -> list[MemoryNode]:
         """Find existing facts the new one supersedes. Pure — returns the nodes
         to retire; the caller expires them atomically with the new fact."""
@@ -264,6 +274,9 @@ class SemanticMemory:
 
         to_expire: list[MemoryNode] = []
         for existing in similar:
+            # Never treat the node being (re)written as its own contradiction.
+            if exclude_id is not None and existing.id == exclude_id:
+                continue
             # Skip already-retired/expired facts. Retirement is recorded on the
             # node as valid_until, not inferred from the supersedes edge.
             if existing.valid_until and existing.valid_until < now:
