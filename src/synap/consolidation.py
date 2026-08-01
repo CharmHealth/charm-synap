@@ -305,6 +305,14 @@ class ConsolidationEngine:
             # No procedure to amend — fall back to semantic storage
             return await self._consolidate_to_semantic(event)
 
+        # Don't re-amend for a pattern this procedure already absorbed. Repeated
+        # consolidation of the same failure pattern would otherwise churn a new
+        # version every cycle and re-insert the same verification field.
+        pattern_key = event.metadata.get("pattern_key")
+        amended_by = list(existing.metadata.get("amended_by", []))
+        if pattern_key and pattern_key in amended_by:
+            return ConsolidationResult(event=event, domain_id=existing.id, success=True)
+
         prompt = (
             f"The following procedure has a repeated failure pattern.\n\n"
             f"Task type: {existing.task_type}\n"
@@ -369,6 +377,7 @@ class ConsolidationEngine:
                 **existing.metadata,
                 "amendment_source": "consolidation",
                 "pattern": event.metadata.get("pattern", ""),
+                "amended_by": amended_by + ([pattern_key] if pattern_key else []),
             },
             episode_ids=[c.metadata.get("episode_id", c.id) for c in event.candidates],
         )

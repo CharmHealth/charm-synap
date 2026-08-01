@@ -20,6 +20,7 @@ from synap.types import (
     ConsolidationTrigger,
     MemoryNode,
     MemoryType,
+    Procedure,
 )
 
 from tests.conftest import FakeEmbedder, FakeLLM
@@ -115,3 +116,48 @@ async def test_reconsolidation_does_not_resurrect_a_retired_fact():
     after = await graph.get_node(fid)
     assert after.valid_until is not None, "re-consolidation resurrected a retired fact"
     assert after.access_count == 99, "re-consolidation reset the fact's lifecycle"
+
+
+async def test_same_failure_pattern_amends_procedure_once():
+    """Re-consolidating the same failure pattern must not re-amend the procedure
+    every cycle — that churns versions and inserts the same field repeatedly."""
+    graph = MemoryGraph()
+    embedder, llm = FakeEmbedder(), FakeLLM()
+    procedural = ProceduralMemory(graph, embedder)
+    await procedural.register(
+        Procedure(
+            task_type="diagnose",
+            description="Diagnose issues",
+            schema={"symptom": {"type": "string"}, "diagnosis": {"type": "string"}},
+            field_ordering=["symptom", "diagnosis"],
+        )
+    )
+    engine = ConsolidationEngine(
+        graph=graph,
+        domain=SemanticMemory(graph, embedder, llm),
+        procedural=procedural,
+        episodic=EpisodicMemory(graph, embedder),
+        llm_provider=llm,
+    )
+    candidates = [_episode_content(f"f{i}") for i in range(3)]
+    for c in candidates:
+        await graph.add_node(c)
+    event = ConsolidationEvent(
+        source_type=MemoryType.EPISODIC,
+        target_type=MemoryType.PROCEDURAL,
+        candidates=candidates,
+        trigger=ConsolidationTrigger.PERIODIC,
+        confidence=0.8,
+        metadata={"task_type": "diagnose", "pattern": "repeated failure", "pattern_key": "outcome:failure"},
+    )
+
+    await engine.process(event)
+    await engine.process(event)  # same failure pattern re-consolidates
+
+    active = [p for p in await procedural.list_procedures(active_only=True) if p.task_type == "diagnose"]
+    assert len(active) == 1
+    assert active[0].field_ordering.count("verification_check") == 1, (
+        f"amended twice: {active[0].field_ordering}"
+    )
+    # base + one amendment, not base + two amendments
+    assert await graph.node_count(MemoryType.PROCEDURAL) == 2
