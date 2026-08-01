@@ -99,16 +99,23 @@ class ProceduralMemory:
                 if proc and await self._is_active(node):
                     return proc
 
-        # Structural match: task_type substring in description
+        # Structural match: task_type substring in description. When several
+        # match, prefer the most specific (longest task_type) rather than
+        # whichever the backend's utility ordering happened to surface first.
         nodes = await self._graph.query(
             node_type=MemoryType.PROCEDURAL, limit=100
         )
+        best: Procedure | None = None
+        best_len = -1
         for node in nodes:
             node_task_type = node.metadata.get("task_type", "")
             if node_task_type and node_task_type in task_description:
                 proc = await self._reconstruct_procedure(node)
-                if proc and await self._is_active(node):
-                    return proc
+                if proc and await self._is_active(node) and len(node_task_type) > best_len:
+                    best = proc
+                    best_len = len(node_task_type)
+        if best is not None:
+            return best
 
         # Fallback: similarity search
         query_embedding = await self._embedder.embed(task_description)
