@@ -1,4 +1,4 @@
-"""Engram — Cognitive memory architecture for LLM agents."""
+"""synap — Cognitive memory architecture for LLM agents."""
 
 from synap.bootstrap import Bootstrap, ProposedKnowledge
 from synap.consolidation import ConsolidationConfig, ConsolidationResult

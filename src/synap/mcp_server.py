@@ -1,4 +1,4 @@
-"""Engram MCP server — exposes agent memory tools via FastMCP.
+"""synap MCP server — exposes agent memory tools via FastMCP.
 
 Usage:
     # stdio (Claude Desktop, Cursor, etc.)
@@ -8,7 +8,7 @@ Usage:
     python -m synap.mcp_server http
 
     # With custom database path
-    ENGRAM_DB=./my_memory python -m synap.mcp_server
+    SYNAP_DB=./my_memory python -m synap.mcp_server
 
 Requires: pip install synap[kuzu] fastmcp
 """
@@ -21,7 +21,7 @@ from typing import Any
 
 from fastmcp import Context, FastMCP
 
-mcp = FastMCP(name="Engram Memory")
+mcp = FastMCP(name="synap Memory")
 
 # Lazy-initialized memory instance (created on first tool call)
 _memory = None
@@ -37,8 +37,8 @@ async def _get_memory():
     from synap.graph import MemoryGraph
     from synap.semantic import SemanticMemory
 
-    db_path = os.environ.get("ENGRAM_DB")
-    embedding_dim = int(os.environ.get("ENGRAM_EMBEDDING_DIM", "8"))
+    db_path = os.environ.get("SYNAP_DB")
+    embedding_dim = int(os.environ.get("SYNAP_EMBEDDING_DIM", "8"))
 
     if db_path:
         from synap.backends.kuzu import KuzuBackend
@@ -49,11 +49,12 @@ async def _get_memory():
     else:
         graph = MemoryGraph()
 
-    # Placeholder providers — override via ENGRAM_* env vars or subclass
-    from tests.conftest import FakeEmbedder, FakeLLM
+    # Offline placeholder providers — configure real ones for production
+    # (wiring a real embedding model from an env var is tracked separately).
+    from synap.providers import HashEmbedder, PlaceholderLLM
 
-    embedder = FakeEmbedder()
-    llm = FakeLLM()
+    embedder = HashEmbedder(dim=embedding_dim)
+    llm = PlaceholderLLM()
 
     domain = SemanticMemory(
         graph=graph, embedding_provider=embedder, llm_provider=llm
@@ -233,6 +234,6 @@ if __name__ == "__main__":
     if use_stdio:
         mcp.run()
     else:
-        host = os.environ.get("ENGRAM_HOST", "127.0.0.1")
-        port = int(os.environ.get("ENGRAM_PORT", "8080"))
+        host = os.environ.get("SYNAP_HOST", "127.0.0.1")
+        port = int(os.environ.get("SYNAP_PORT", "8080"))
         mcp.run(transport="http", host=host, port=port)
