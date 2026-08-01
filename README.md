@@ -65,6 +65,8 @@ class OpenAILLM:
 
 Any class matching the `EmbeddingProvider` and `LLMProvider` protocols works. No inheritance required. See [docs/architecture.md](docs/architecture.md#provider-model) for details.
 
+To try synap without wiring a real model, the package ships offline placeholders — `HashEmbedder` and `PlaceholderLLM` in `synap.providers`. They run with no external services, but are not semantic (hash-based vectors, canned LLM output), so use real providers for meaningful results.
+
 ## Quick Start
 
 ```python
