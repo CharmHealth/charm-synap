@@ -36,3 +36,21 @@ async def test_match_prefers_most_specific_task_type():
     assert matched.task_type == "classify_urgent", (
         f"expected the most specific match, got {matched.task_type}"
     )
+
+
+async def test_reconstructing_a_retired_version_does_not_hijack_the_index():
+    """A cold-cache match reconstructs every matching version, retired ones
+    included. Reconstructing a retired version must not repoint the task_type
+    index at it — otherwise a later register() would supersede the retired node
+    and leave two active versions."""
+    graph = MemoryGraph()
+    a = ProceduralMemory(graph, FakeEmbedder())
+    v1, v2 = _proc("classify"), _proc("classify")
+    await a.register(v1)
+    await a.register(v2)  # v1 retired, v2 active
+
+    b = ProceduralMemory(graph, FakeEmbedder())  # fresh instance (cold cache)
+    await b._reconstruct_procedure(await graph.get_node(v2.id))  # index -> v2 (active)
+    await b._reconstruct_procedure(await graph.get_node(v1.id))  # retired, reconstructed last
+
+    assert b._task_type_index["classify"] == v2.id, "retired version hijacked the index"

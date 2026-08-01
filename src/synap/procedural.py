@@ -203,7 +203,11 @@ class ProceduralMemory:
         )
 
         self._procedures[node.id] = procedure
-        self._task_type_index[task_type] = node.id
+        # The task_type index tracks the *active* procedure per task_type; a
+        # retired version must not hijack it, or a later register() would
+        # supersede the wrong node and leave two active versions.
+        if not node.metadata.get("superseded"):
+            self._task_type_index[task_type] = node.id
         return procedure
 
     async def _is_active(self, node: MemoryNode) -> bool:
