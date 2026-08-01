@@ -19,8 +19,8 @@ from datetime import datetime
 import pytest
 
 from synap.backends.kuzu import KuzuBackend
-from synap.backends.sqlite import SQLiteBackend
 from synap.backends.postgres import PostgresBackend
+from synap.backends.sqlite import SQLiteBackend
 
 try:
     import asyncpg

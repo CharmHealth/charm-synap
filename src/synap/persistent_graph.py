@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from synap._utils import (
@@ -17,6 +17,10 @@ from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 # Re-exported for callers that import it from here; canonical home is synap._utils.
 __all__ = ["PersistentGraph", "compute_decay_score"]
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _node_to_dict(node: MemoryNode) -> dict[str, Any]:
@@ -45,7 +49,7 @@ def _dict_to_node(d: dict[str, Any]) -> MemoryNode:
         access_count=d.get("access_count", 0),
         created_at=_parse_dt(d.get("created_at")),
         last_accessed=_parse_dt(d.get("last_accessed")),
-        metadata=d.get("metadata") if isinstance(d.get("metadata"), dict) else {},
+        metadata=_as_dict(d.get("metadata")),
         valid_from=_parse_dt_optional(d.get("valid_from")),
         valid_until=_parse_dt_optional(d.get("valid_until")),
     )
@@ -71,7 +75,7 @@ def _dict_to_edge(d: dict[str, Any]) -> MemoryEdge:
         relation_type=d["relation_type"],
         weight=d.get("weight", 1.0),
         created_at=_parse_dt(d.get("created_at")),
-        metadata=d.get("metadata") if isinstance(d.get("metadata"), dict) else {},
+        metadata=_as_dict(d.get("metadata")),
     )
 
 
@@ -80,7 +84,7 @@ def _parse_dt(val: Any) -> datetime:
         return val
     if isinstance(val, str):
         return datetime.fromisoformat(val)
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _parse_dt_optional(val: Any) -> datetime | None:
@@ -239,7 +243,7 @@ class PersistentGraph:
         node.touch()  # sets last_accessed = now
         seconds = max(
             1.0,
-            (datetime.now(timezone.utc) - node.last_accessed).total_seconds(),
+            (datetime.now(UTC) - node.last_accessed).total_seconds(),
         )
         node.utility_score = compute_decay_score(
             seconds / 3600, node.access_count, self._utility_decay_rate
@@ -249,7 +253,7 @@ class PersistentGraph:
     async def decay_all(self) -> None:
         # Server-side path: single Cypher SET, no data leaves the DB
         if hasattr(self._backend, "decay_all_scores"):
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            now_ms = int(datetime.now(UTC).timestamp() * 1000)
             await self._call(
                 self._backend.decay_all_scores,
                 self._utility_decay_rate,
@@ -258,7 +262,7 @@ class PersistentGraph:
             return
 
         # Fallback for backends without server-side decay
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         all_nodes = await self._call(
             self._backend.query_nodes, None, None, 100_000
         )

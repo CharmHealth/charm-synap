@@ -4,7 +4,7 @@ from synap.facade import CognitiveMemory
 from synap.graph import MemoryGraph
 from synap.semantic import SemanticMemory
 from synap.tools import memory_tools
-from synap.types import EpisodeOutcome, MemoryType, Procedure
+from synap.types import Procedure
 from tests.conftest import FakeEmbedder, FakeLLM
 
 

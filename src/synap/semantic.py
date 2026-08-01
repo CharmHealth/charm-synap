@@ -9,12 +9,11 @@ directly.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from synap.protocols import EmbeddingProvider, GraphStore, LLMProvider
 from synap.types import CapacityHints, DomainResult, MemoryEdge, MemoryNode, MemoryType
-
 
 _CONTRADICTION_PROMPT = """\
 Existing fact: {existing}
@@ -66,7 +65,7 @@ class SemanticMemory:
         metadata: dict[str, Any] | None = None,
         retrieval_hints: dict[str, Any] | None = None,
     ) -> list[DomainResult]:
-        as_of = (retrieval_hints or {}).get("as_of", datetime.now(timezone.utc))
+        as_of = (retrieval_hints or {}).get("as_of", datetime.now(UTC))
         result = await self.search(task_description, as_of=as_of)
         return [
             DomainResult(
@@ -104,7 +103,7 @@ class SemanticMemory:
         check_contradictions: bool = True,
         node_id: str | None = None,
     ) -> str:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         embedding = await self._embedder.embed(content)
 
         # A deterministic-id write whose target already exists is an idempotent
@@ -203,7 +202,7 @@ class SemanticMemory:
         if not entry_points:
             return SemanticResult()
 
-        ref_time = as_of or datetime.now(timezone.utc)
+        ref_time = as_of or datetime.now(UTC)
 
         all_nodes: list[MemoryNode] = []
         all_edges: list[MemoryEdge] = []
@@ -286,6 +285,7 @@ class SemanticMemory:
             new_embedding, node_type=MemoryType.SEMANTIC, limit=5
         )
 
+        assert self._llm is not None  # store() only calls this when an llm is set
         to_expire: list[MemoryNode] = []
         for existing in similar:
             # Skip already-retired/expired facts. Retirement is recorded on the

@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import kuzu
-
 
 # ---------------------------------------------------------------------------
 # Schema constants
@@ -43,7 +42,7 @@ CREATE REL TABLE IF NOT EXISTS MemoryEdge(
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class KuzuBackend:
@@ -66,11 +65,14 @@ class KuzuBackend:
     ) -> None:
         self._path = str(path)
         self._embedding_dim = embedding_dim
-        self._db = kuzu.Database(self._path, buffer_pool_size=buffer_pool_mb * 1024 * 1024)
+        self._db: kuzu.Database | None = kuzu.Database(
+            self._path, buffer_pool_size=buffer_pool_mb * 1024 * 1024
+        )
         self._ensure_schema()
 
     def _conn(self) -> kuzu.Connection:
         """Create a fresh connection for the current operation."""
+        assert self._db is not None  # backend is closed
         return kuzu.Connection(self._db)
 
     def _ensure_schema(self) -> None:
@@ -194,6 +196,7 @@ class KuzuBackend:
             """,
             parameters={"id": node_id},
         )
+        assert not isinstance(result, list)  # single statement -> one QueryResult
         if not result.has_next():
             return None
         row = result.get_next()
@@ -428,6 +431,7 @@ class KuzuBackend:
             result = conn.execute(
                 "MATCH (n:MemoryNode) RETURN count(n)"
             )
+        assert not isinstance(result, list)  # single statement -> one QueryResult
         return result.get_next()[0] if result.has_next() else 0
 
     def edge_count(self, relation_type: str | None = None) -> int:
@@ -441,6 +445,7 @@ class KuzuBackend:
             result = conn.execute(
                 "MATCH ()-[e:MemoryEdge]->() RETURN count(e)"
             )
+        assert not isinstance(result, list)  # single statement -> one QueryResult
         return result.get_next()[0] if result.has_next() else 0
 
     # --- Vector similarity search ---

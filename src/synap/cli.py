@@ -59,7 +59,6 @@ def _serve(args: argparse.Namespace) -> None:
     """
     # Lazy imports so CLI is fast when just checking --help
     from synap.facade import CognitiveMemory
-    from synap.graph import MemoryGraph
     from synap.semantic import SemanticMemory
 
     # Build graph
@@ -85,6 +84,7 @@ def _serve(args: argparse.Namespace) -> None:
 
     if args.framework == "fastapi":
         import uvicorn
+
         from synap.contrib.fastapi import create_app
 
         app = create_app(memory)
@@ -104,13 +104,13 @@ def _build_graph(args: argparse.Namespace):
         return MemoryGraph()
 
     elif args.backend == "sqlite":
-        from synap.persistent_graph import PersistentGraph
         from synap.backends.sqlite import SQLiteBackend
+        from synap.persistent_graph import PersistentGraph
         return PersistentGraph(backend=SQLiteBackend(args.db_path))
 
     elif args.backend == "kuzu":
-        from synap.persistent_graph import PersistentGraph
         from synap.backends.kuzu import KuzuBackend
+        from synap.persistent_graph import PersistentGraph
         return PersistentGraph(
             backend=KuzuBackend(args.db_path, embedding_dim=args.embedding_dim)
         )
@@ -120,8 +120,8 @@ def _build_graph(args: argparse.Namespace):
             print("Error: --db-url required for postgres backend", file=sys.stderr)
             sys.exit(1)
         # Postgres is async — handled differently
-        from synap.persistent_graph import PersistentGraph
         from synap.backends.postgres import PostgresBackend
+        from synap.persistent_graph import PersistentGraph
         return PersistentGraph(backend=PostgresBackend(args.db_url))
 
     raise ValueError(f"Unknown backend: {args.backend}")

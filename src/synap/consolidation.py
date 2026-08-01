@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
 import hashlib
 import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from synap._utils import safe_parse_json
 from synap.protocols import GraphStore, LLMProvider, SemanticDomain

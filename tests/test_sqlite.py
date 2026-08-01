@@ -1,6 +1,5 @@
 """Tests for SQLite storage backend."""
 
-import json
 import tempfile
 from pathlib import Path
 

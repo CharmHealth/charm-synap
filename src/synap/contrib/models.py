@@ -11,7 +11,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-
 # ── Knowledge Unit (the cross-app shared format) ──
 
 

@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 from synap._utils import safe_parse_json
-from synap.bootstrap import Bootstrap, ProposedKnowledge, ProposedNode, ProposedEdge
+from synap.bootstrap import Bootstrap
 from synap.episodic import EpisodicMemory
 from synap.graph import MemoryGraph
 from synap.semantic import SemanticMemory
@@ -164,7 +164,7 @@ async def test_full_bootstrap_flow():
 
     assert len(proposed.nodes) > 0
 
-    node_ids = await bootstrap.accept(proposed)
+    await bootstrap.accept(proposed)
 
     result = await semantic.search("step therapy")
     assert len(result.nodes) > 0

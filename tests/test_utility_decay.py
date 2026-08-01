@@ -24,9 +24,7 @@ telemetry we do not have yet; deferred.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-
-import pytest
+from datetime import UTC, datetime, timedelta
 
 from synap.graph import MemoryGraph
 from synap.persistent_graph import compute_decay_score
@@ -36,7 +34,7 @@ THRESHOLD = 0.1
 
 
 def _ago(days: float) -> datetime:
-    return datetime.now(timezone.utc) - timedelta(days=days)
+    return datetime.now(UTC) - timedelta(days=days)
 
 
 # --- canonical pure formula (persistent_graph.compute_decay_score) ---

@@ -12,10 +12,9 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
-from synap.facade import CognitiveMemory
-from synap.graph import MemoryGraph
-from synap.semantic import SemanticMemory
 from synap.contrib.fastapi import create_app
+from synap.facade import CognitiveMemory
+from synap.semantic import SemanticMemory
 
 
 @pytest.fixture
@@ -383,6 +382,5 @@ async def test_knowledge_lifecycle(client):
     })
     assert search_resp.status_code == 200
     results = search_resp.json()["results"]
-    result_ids = [r["id"] for r in results]
     # Both the highlight and the data point should be findable
     assert len(results) >= 1

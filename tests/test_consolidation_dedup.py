@@ -8,7 +8,7 @@ tool), never the episode count, so it survives the pattern growing.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from synap.consolidation import ConsolidationEngine, _consolidated_fact_id
 from synap.episodic import EpisodicMemory
@@ -22,7 +22,6 @@ from synap.types import (
     MemoryType,
     Procedure,
 )
-
 from tests.conftest import FakeEmbedder, FakeLLM
 
 
@@ -106,7 +105,7 @@ async def test_reconsolidation_does_not_resurrect_a_retired_fact():
     assert fact is not None
     # Externally retire it (as a newer contradicting fact would), and give it a
     # lived-in lifecycle.
-    fact.valid_until = datetime.now(timezone.utc)
+    fact.valid_until = datetime.now(UTC)
     fact.access_count = 99
     fact.utility_score = 0.05
     await graph.add_node(fact)

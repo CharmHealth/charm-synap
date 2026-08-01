@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _coerce_timestamp(value: Any) -> datetime:
@@ -26,9 +26,9 @@ def _coerce_timestamp(value: Any) -> datetime:
         # fromisoformat handles "+00:00" and naive ISO strings; assume UTC if naive.
         dt = datetime.fromisoformat(value)
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
         return dt
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _coerce_timestamp_optional(value: Any) -> datetime | None:

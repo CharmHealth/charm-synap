@@ -1,12 +1,13 @@
 """Tests for the three memory subsystems."""
 
+from datetime import UTC
+
 from synap.episodic import EpisodicMemory
 from synap.graph import MemoryGraph
 from synap.procedural import ProceduralMemory
 from synap.semantic import SemanticMemory
 from synap.types import Episode, EpisodeOutcome, MemoryType, Procedure, ToolCall
 from tests.conftest import FakeEmbedder, FakeLLM
-
 
 # --- Semantic Memory ---
 
@@ -126,7 +127,7 @@ async def test_semantic_store_skip_contradictions(graph: MemoryGraph, embedder: 
     sem = SemanticMemory(graph=graph, embedding_provider=embedder, llm_provider=llm)
 
     id1 = await sem.store("Patient takes metformin daily")
-    id2 = await sem.store(
+    await sem.store(
         "Patient discontinued metformin",
         check_contradictions=False,
     )
@@ -143,7 +144,7 @@ async def test_semantic_no_llm_skips_contradictions(graph: MemoryGraph, embedder
     sem = SemanticMemory(graph=graph, embedding_provider=embedder)  # no LLM
 
     id1 = await sem.store("Patient takes metformin daily")
-    id2 = await sem.store("Patient discontinued metformin")
+    await sem.store("Patient discontinued metformin")
 
     # No supersession because no LLM to detect it
     assert not await graph.has_incoming_edge(id1, "supersedes")
@@ -151,13 +152,14 @@ async def test_semantic_no_llm_skips_contradictions(graph: MemoryGraph, embedder
 
 async def test_semantic_retrieve_filters_expired(graph: MemoryGraph, embedder: FakeEmbedder):
     """Retrieve filters out nodes past their valid_until date."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta
+
     from synap.types import MemoryNode
 
     sem = SemanticMemory(graph=graph, embedding_provider=embedder)
 
     # Manually create an expired node
-    past = datetime.now(timezone.utc) - timedelta(days=30)
+    past = datetime.now(UTC) - timedelta(days=30)
     expired_node = MemoryNode(
         content="Expired insurance coverage",
         node_type=MemoryType.SEMANTIC,

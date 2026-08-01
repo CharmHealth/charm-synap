@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from synap.facade import CognitiveMemory
-from synap.types import EpisodeOutcome, MemoryEdge, MemoryNode, MemoryType
+from synap.types import EpisodeOutcome, MemoryNode, MemoryType
 
 
 def memory_tools(memory: CognitiveMemory) -> list[dict[str, Any]]:

@@ -248,10 +248,10 @@ async def test_evict_server_side(pgraph: PersistentGraph):
 
 async def test_facade_with_kuzu_backend(tmp_path: Path):
     """Full integration: CognitiveMemory with Kùzu backend."""
-    from tests.conftest import FakeEmbedder, FakeLLM
     from synap.facade import CognitiveMemory
     from synap.semantic import SemanticMemory
     from synap.types import EpisodeOutcome, Procedure
+    from tests.conftest import FakeEmbedder, FakeLLM
 
     backend = KuzuBackend(tmp_path / "facade_test", embedding_dim=8)
     embedder = FakeEmbedder()

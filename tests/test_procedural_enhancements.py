@@ -10,7 +10,6 @@ from __future__ import annotations
 from synap.graph import MemoryGraph
 from synap.procedural import ProceduralMemory
 from synap.types import Procedure
-
 from tests.conftest import FakeEmbedder
 
 

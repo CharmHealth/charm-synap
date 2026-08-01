@@ -12,7 +12,7 @@ that its status reads no longer depend on the edge.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -20,12 +20,11 @@ from synap.graph import MemoryGraph
 from synap.procedural import ProceduralMemory
 from synap.semantic import SemanticMemory
 from synap.types import Procedure
-
 from tests.conftest import FakeEmbedder, FakeLLM
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _proc(task_type: str, description: str, fields: list[str]) -> Procedure:

@@ -17,10 +17,9 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any, Optional
+from typing import Any
 
-from fastmcp import FastMCP, Context
-
+from fastmcp import Context, FastMCP
 
 mcp = FastMCP(name="Engram Memory")
 
@@ -34,9 +33,9 @@ async def _get_memory():
     if _memory is not None:
         return _memory
 
+    from synap.facade import CognitiveMemory
     from synap.graph import MemoryGraph
     from synap.semantic import SemanticMemory
-    from synap.facade import CognitiveMemory
 
     db_path = os.environ.get("ENGRAM_DB")
     embedding_dim = int(os.environ.get("ENGRAM_EMBEDDING_DIM", "8"))
@@ -71,7 +70,7 @@ async def _get_memory():
 @mcp.tool
 async def remember_fact(
     content: str,
-    metadata: Optional[dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Store a fact in long-term semantic memory.
@@ -135,11 +134,11 @@ async def recall(
 async def record_observation(
     description: str,
     outcome: str = "success",
-    output: Optional[dict[str, Any]] = None,
-    correction: Optional[str] = None,
-    task_type: Optional[str] = None,
-    input_data: Optional[dict[str, Any]] = None,
-    tags: Optional[list[str]] = None,
+    output: dict[str, Any] | None = None,
+    correction: str | None = None,
+    task_type: str | None = None,
+    input_data: dict[str, Any] | None = None,
+    tags: list[str] | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Record an observation or experience for future learning.
@@ -200,8 +199,8 @@ async def suggest_amendment(
 
 @mcp.tool
 async def get_procedure(
-    task_type: Optional[str] = None,
-    task_description: Optional[str] = None,
+    task_type: str | None = None,
+    task_description: str | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Look up the active procedure and output schema for a task type.

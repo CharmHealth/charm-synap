@@ -123,6 +123,7 @@ class SemanticDomain(Protocol):
         insights: list[str],
         source_episodes: list[MemoryNode],
         metadata: dict[str, Any] | None = None,
+        node_id: str | None = None,
     ) -> str | None: ...
 
 

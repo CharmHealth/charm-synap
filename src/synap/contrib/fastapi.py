@@ -20,9 +20,6 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException
 
-from synap.facade import CognitiveMemory
-from synap.semantic import SemanticMemory
-from synap.types import EpisodeOutcome, MemoryType
 from synap.contrib.models import (
     ConnectRequest,
     ConnectResponse,
@@ -40,6 +37,9 @@ from synap.contrib.models import (
     StoreKnowledgeRequest,
     StoreKnowledgeResponse,
 )
+from synap.facade import CognitiveMemory
+from synap.semantic import SemanticMemory
+from synap.types import EpisodeOutcome
 
 
 def create_router(memory: CognitiveMemory) -> APIRouter:
@@ -106,7 +106,6 @@ def create_router(memory: CognitiveMemory) -> APIRouter:
             document_type=source_data.get("document_type"),
         )
 
-        edges = await memory.graph.edges_between(node_id, node_id)
         outgoing = await memory.graph.traverse(node_id, max_depth=1, max_nodes=50)
         connected_ids = [n.id for n in outgoing if n.id != node_id]
 
