@@ -16,23 +16,23 @@ Or use the convenience server:
 from __future__ import annotations
 
 import datetime
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict
 from typing import Any
 
-from sanic import Blueprint, HTTPResponse, json as sanic_json
-from sanic.exceptions import NotFound, InvalidUsage
+from sanic import Blueprint, HTTPResponse
+from sanic import json as sanic_json
+from sanic.exceptions import InvalidUsage, NotFound
 
-from synap.facade import CognitiveMemory
-from synap.semantic import SemanticMemory
-from synap.types import EpisodeOutcome
 from synap.contrib.models import (
     ConnectRequest,
-    KnowledgeSource,
     PrepareCallRequest,
     RecordOutcomeRequest,
     SearchRequest,
     StoreKnowledgeRequest,
 )
+from synap.facade import CognitiveMemory
+from synap.semantic import SemanticMemory
+from synap.types import EpisodeOutcome
 
 
 def _serialize(obj: Any) -> Any:
@@ -52,9 +52,9 @@ def _json(data: dict[str, Any] | list[Any], status: int = 200) -> HTTPResponse:
 
 def _parse(model_cls: type, body: dict[str, Any]) -> Any:
     try:
-        return model_cls.model_validate(body)
+        return model_cls.model_validate(body)  # type: ignore[attr-defined]  # pydantic BaseModel subclass
     except Exception as e:
-        raise InvalidUsage(f"Invalid request: {e}")
+        raise InvalidUsage(f"Invalid request: {e}") from e
 
 
 def create_blueprint(memory: CognitiveMemory) -> Blueprint:

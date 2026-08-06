@@ -3,7 +3,52 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
+
+from synap.types import MemoryType
+
+
+def is_eviction_protected(node_type: str, metadata: dict[str, Any] | None) -> bool:
+    """Whether a node is exempt from utility-based eviction (CH-728 item 4).
+
+    An active procedure is a durable capability — expensive to relearn and
+    naturally bounded (one active per task_type) — so it is never evicted while
+    active. A retired (superseded) procedure and every other node type evict
+    normally. Retirement is read from the intrinsic `superseded` flag, never the
+    supersedes edge.
+    """
+    if node_type != MemoryType.PROCEDURAL.value:
+        return False
+    return not (metadata or {}).get("superseded", False)
+
+
+def compute_decay_score(
+    hours_since_access: float,
+    access_count: int,
+    decay_rate: float = 0.01,
+) -> float:
+    """Canonical utility score: recency gates frequency.
+
+    ``score = r * (1 + f)`` where recency ``r = (1 - decay_rate) ** hours``
+    decays toward 0 as a node goes cold, and the frequency proxy
+    ``f = min(1, access_count / 20)`` boosts a node by up to 2x. Because recency
+    *multiplies*, a cold node scores ~0 no matter how often it was used (no
+    immortality floor); because ``f`` is floored at 0 (so the factor is >= 1), a
+    fresh-but-rarely-used node still survives on recency alone.
+
+    ``hours_since_access`` must be measured from ``last_accessed`` — recency, not
+    age from creation.
+
+    The ``/20`` divisor and the cap at ``f = 1`` are untuned inherited constants;
+    the invariants above fix the structure, not the scale. Tuning them needs
+    workload telemetry (CH-728). The Kuzu ``decay_all_scores`` Cypher is a
+    server-side copy of this formula and must be kept in sync.
+    """
+    hours = max(1.0 / 3600, hours_since_access)
+    decay = math.pow(1 - decay_rate, hours)
+    frequency_bonus = min(1.0, access_count / 20)
+    return decay * (1 + frequency_bonus)
 
 
 def cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -20,7 +65,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
         )
     if len(a) == 0:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = sum(x * x for x in a) ** 0.5
     norm_b = sum(x * x for x in b) ** 0.5
     if norm_a == 0 or norm_b == 0:

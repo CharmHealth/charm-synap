@@ -8,7 +8,6 @@ from synap.semantic import SemanticMemory
 from synap.types import (
     CapacityHints,
     EpisodeOutcome,
-    MemoryType,
     Procedure,
 )
 from tests.conftest import FakeEmbedder, FakeLLM
@@ -425,7 +424,7 @@ async def test_process_conversation_with_tool_calls():
     """process_conversation parses tool calls from messages."""
     memory = _make_memory()
 
-    episode_id = await memory.process_conversation(
+    await memory.process_conversation(
         messages=[
             {"role": "user", "content": "Check coverage for knee replacement"},
             {

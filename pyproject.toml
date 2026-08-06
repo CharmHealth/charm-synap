@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "synap"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cognitive memory architecture for LLM agents"
 readme = "README.md"
 license = "MIT"
@@ -45,6 +45,8 @@ dev = [
     "asyncpg>=0.30.0",
     "httpx>=0.27",
     "sanic-testing>=24.6.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [project.scripts]
@@ -56,3 +58,34 @@ packages = ["src/synap"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pragmatic baseline: errors, pyflakes, import sorting, pyupgrade, bugbear.
+# Noisier opinionated sets (SIM/S/BLE) are deferred to a later tightening.
+select = ["E", "F", "I", "UP", "B"]
+# E501 (line length) is a formatting concern owned by `ruff format`, not lint.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Atomicity tests assert that *any* failure rolls back; the exception type is
+# secondary and varies by backend.
+"tests/test_episode_atomicity.py" = ["B017"]
+# Postgres tests import asyncpg conditionally after a DSN/skip guard (E402), and
+# assert a broad failure on the write path (B017).
+"tests/test_postgres.py" = ["B017", "E402"]
+
+[tool.mypy]
+python_version = "3.11"
+# Third-party deps without stubs (asyncpg, fastmcp, kuzu) — don't fail on them.
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# kuzu's QueryResult.get_next() is typed as returning list | dict; single-row
+# reads index into the list, which the code relies on. Suppress that narrowing
+# noise for this module only rather than casting every row access.
+module = "synap.backends.kuzu"
+disable_error_code = ["arg-type", "index"]

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
-
+import hashlib
 import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from synap._utils import safe_parse_json
 from synap.protocols import GraphStore, LLMProvider, SemanticDomain
@@ -22,6 +22,26 @@ from synap.types import (
 if TYPE_CHECKING:
     from synap.episodic import EpisodicMemory
     from synap.procedural import ProceduralMemory
+
+
+def _consolidated_fact_id(metadata: dict[str, Any]) -> str | None:
+    """Deterministic id for a consolidated fact, so re-consolidating the same
+    pattern upserts one fact instead of spraying random-UUID duplicates.
+
+    Identity is the stable pattern key (task_type + key), independent of how many
+    episodes the pattern spans. Retrieval-triggered consolidations have no
+    pattern; they key on the query string instead. Anything without either keeps
+    a random id (no dedup).
+    """
+    task_type = metadata.get("task_type")
+    pattern_key = metadata.get("pattern_key")
+    if task_type and pattern_key:
+        basis = f"pattern\x00{task_type}\x00{pattern_key}"
+    elif metadata.get("query"):
+        basis = f"query\x00{metadata['query']}"
+    else:
+        return None
+    return "consolidated:" + hashlib.sha256(basis.encode()).hexdigest()[:24]
 
 
 @dataclass
@@ -87,6 +107,7 @@ class ConsolidationEngine:
                     metadata={
                         "task_type": pattern.task_type,
                         "pattern": pattern.pattern_description,
+                        "pattern_key": pattern.key,
                     },
                 )
             elif pattern.outcome == EpisodeOutcome.SUCCESS:
@@ -105,6 +126,7 @@ class ConsolidationEngine:
                         metadata={
                             "task_type": pattern.task_type,
                             "pattern": pattern.pattern_description,
+                            "pattern_key": pattern.key,
                         },
                     )
 
@@ -119,7 +141,7 @@ class ConsolidationEngine:
 
         # Skip patterns already processed from event-driven consolidation
         queued_patterns = self._processed_patterns | {
-            (e.metadata.get("task_type"), e.metadata.get("pattern"))
+            (e.metadata.get("task_type"), e.metadata.get("pattern_key"))
             for e in self._queue
         }
 
@@ -132,7 +154,7 @@ class ConsolidationEngine:
                     min_occurrences=self._config.min_pattern_occurrences,
                 )
                 for pattern in patterns:
-                    pattern_key = (pattern.task_type, pattern.pattern_description)
+                    pattern_key = (pattern.task_type, pattern.key)
                     if pattern_key in queued_patterns:
                         continue
                     candidate_nodes = [
@@ -157,6 +179,7 @@ class ConsolidationEngine:
                                 metadata={
                                     "task_type": pattern.task_type,
                                     "pattern": pattern.pattern_description,
+                                    "pattern_key": pattern.key,
                                 },
                             )
                         )
@@ -186,7 +209,7 @@ class ConsolidationEngine:
     def snapshot_queued_patterns(self) -> None:
         """Capture current queue patterns before draining."""
         self._processed_patterns = {
-            (e.metadata.get("task_type"), e.metadata.get("pattern"))
+            (e.metadata.get("task_type"), e.metadata.get("pattern_key"))
             for e in self._queue
         }
 
@@ -258,6 +281,7 @@ class ConsolidationEngine:
             insights=[fact.strip()],
             source_episodes=event.candidates,
             metadata=event.metadata,
+            node_id=_consolidated_fact_id(event.metadata),
         )
 
         for candidate in event.candidates:
@@ -279,6 +303,14 @@ class ConsolidationEngine:
         if existing is None:
             # No procedure to amend — fall back to semantic storage
             return await self._consolidate_to_semantic(event)
+
+        # Don't re-amend for a pattern this procedure already absorbed. Repeated
+        # consolidation of the same failure pattern would otherwise churn a new
+        # version every cycle and re-insert the same verification field.
+        pattern_key = event.metadata.get("pattern_key")
+        amended_by = list(existing.metadata.get("amended_by", []))
+        if pattern_key and pattern_key in amended_by:
+            return ConsolidationResult(event=event, domain_id=existing.id, success=True)
 
         prompt = (
             f"The following procedure has a repeated failure pattern.\n\n"
@@ -344,6 +376,7 @@ class ConsolidationEngine:
                 **existing.metadata,
                 "amendment_source": "consolidation",
                 "pattern": event.metadata.get("pattern", ""),
+                "amended_by": amended_by + ([pattern_key] if pattern_key else []),
             },
             episode_ids=[c.metadata.get("episode_id", c.id) for c in event.candidates],
         )

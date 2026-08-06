@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from synap.graph import MemoryGraph
-from synap.protocols import EmbeddingProvider, LLMProvider
 
 
 class FakeEmbedder:

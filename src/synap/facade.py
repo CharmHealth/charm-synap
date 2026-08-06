@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
-import json
-
 from synap._utils import safe_parse_json
-from synap.consolidation import ConsolidationEngine, ConsolidationConfig, ConsolidationResult
+from synap.consolidation import (
+    ConsolidationConfig,
+    ConsolidationEngine,
+    ConsolidationResult,
+)
 from synap.episodic import EpisodicMemory
 from synap.graph import MemoryGraph
 from synap.persistent_graph import PersistentGraph
 from synap.procedural import ProceduralMemory
-from synap.protocols import EmbeddingProvider, GraphStore, LLMProvider, SemanticDomain, StorageBackend
+from synap.protocols import (
+    EmbeddingProvider,
+    GraphStore,
+    LLMProvider,
+    SemanticDomain,
+    StorageBackend,
+)
 from synap.types import (
     CapacityHints,
-    ConsolidationEvent,
     DomainResult,
     Episode,
     EpisodeOutcome,
@@ -24,7 +32,6 @@ from synap.types import (
     PreparedContext,
     ToolCall,
 )
-
 
 _EXTRACT_PROMPT = """\
 Analyze this conversation and extract:

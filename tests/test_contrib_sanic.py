@@ -17,10 +17,9 @@ pytest.importorskip("sanic")
 
 from sanic import Sanic
 
-from synap.facade import CognitiveMemory
-from synap.graph import MemoryGraph
-from synap.semantic import SemanticMemory
 from synap.contrib.sanic import create_blueprint
+from synap.facade import CognitiveMemory
+from synap.semantic import SemanticMemory
 
 # Allow multiple Sanic apps with the same name across tests
 Sanic.test_mode = True
@@ -394,6 +393,5 @@ async def test_knowledge_lifecycle(app):
     })
     assert search_resp.status == 200
     results = search_resp.json["results"]
-    result_ids = [r["id"] for r in results]
     # Both the highlight and the data point should be findable
     assert len(results) >= 1

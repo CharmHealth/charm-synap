@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
-from synap._utils import cosine_similarity, select_evictions
+from synap._utils import (
+    compute_decay_score,
+    cosine_similarity,
+    is_eviction_protected,
+    select_evictions,
+)
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 
@@ -113,17 +117,19 @@ class MemoryGraph:
     ) -> list[MemoryNode]:
         if direction == "outgoing":
             edge_ids = self._outgoing.get(node_id, [])
-            get_neighbor_id = lambda e: e.target_id
         elif direction == "incoming":
             edge_ids = self._incoming.get(node_id, [])
-            get_neighbor_id = lambda e: e.source_id
         else:
             edge_ids = self._outgoing.get(node_id, []) + self._incoming.get(
                 node_id, []
             )
-            get_neighbor_id = (
-                lambda e: e.target_id if e.source_id == node_id else e.source_id
-            )
+
+        def _neighbor_id(edge: MemoryEdge) -> str:
+            if direction == "outgoing":
+                return edge.target_id
+            if direction == "incoming":
+                return edge.source_id
+            return edge.target_id if edge.source_id == node_id else edge.source_id
 
         results = []
         for eid in edge_ids:
@@ -132,7 +138,7 @@ class MemoryGraph:
                 continue
             if edge_type is not None and edge.relation_type != edge_type:
                 continue
-            neighbor = self._nodes.get(get_neighbor_id(edge))
+            neighbor = self._nodes.get(_neighbor_id(edge))
             if neighbor is not None:
                 results.append(neighbor)
         return results
@@ -208,29 +214,28 @@ class MemoryGraph:
         node = self._nodes.get(node_id)
         if node is None:
             return
-        node.touch()
-        seconds_since_creation = max(
+        node.touch()  # sets last_accessed = now
+        seconds = max(
             1.0,
-            (datetime.now(timezone.utc) - node.created_at).total_seconds(),
+            (datetime.now(UTC) - node.last_accessed).total_seconds(),
         )
-        hours = seconds_since_creation / 3600
-        decay = math.pow(1 - self._utility_decay_rate, hours)
-        frequency_bonus = min(1.0, node.access_count / 20)
-        node.utility_score = decay + frequency_bonus
+        node.utility_score = compute_decay_score(
+            seconds / 3600, node.access_count, self._utility_decay_rate
+        )
 
     async def decay_all(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for node in self._nodes.values():
             seconds = max(1.0, (now - node.last_accessed).total_seconds())
-            hours = seconds / 3600
-            decay = math.pow(1 - self._utility_decay_rate, hours)
-            frequency_bonus = min(1.0, node.access_count / 20)
-            node.utility_score = decay + frequency_bonus
+            node.utility_score = compute_decay_score(
+                seconds / 3600, node.access_count, self._utility_decay_rate
+            )
 
     async def evict(self, threshold: float = 0.1) -> list[str]:
         items = [
             (nid, node.utility_score, (node.metadata or {}).get("episode_id"))
             for nid, node in self._nodes.items()
+            if not is_eviction_protected(node.node_type.value, node.metadata)
         ]
         to_evict = select_evictions(items, threshold)
         for nid in to_evict:

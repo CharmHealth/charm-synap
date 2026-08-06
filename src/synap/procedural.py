@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from synap.protocols import EmbeddingProvider, GraphStore
@@ -27,7 +28,16 @@ class ProceduralMemory:
         self._task_type_index: dict[str, str] = {}
 
     async def register(self, procedure: Procedure) -> str:
-        existing_id = self._task_type_index.get(procedure.task_type)
+        # Read the versions to retire from the graph, not from _task_type_index.
+        # That index is a lazily-seeded cache: a fresh instance starts empty, so
+        # trusting it would let a cold register() skip the tombstone and leave two
+        # nodes active for one task_type — permanently, since active procedures
+        # are exempt from eviction.
+        retiring = [
+            n
+            for n in await self._active_versions(procedure.task_type)
+            if n.id != procedure.id
+        ]
 
         node = MemoryNode(
             content=f"{procedure.task_type}: {procedure.description}",
@@ -47,22 +57,32 @@ class ProceduralMemory:
                 "episode_ids": procedure.episode_ids,
             },
         )
-        await self._graph.add_node(node)
+        nodes = [node]
+        edges: list[MemoryEdge] = []
+        for old_node in retiring:
+            # Tombstone the retired version intrinsically (status), and keep
+            # the supersedes edge for lineage. Status reads consult the flag,
+            # never the edge, so deleting this new version cannot resurrect
+            # the old one. Write a copy (not the stored node) so a failed
+            # write_batch rolls back cleanly instead of leaving the flag set.
+            retired = replace(
+                old_node, metadata={**old_node.metadata, "superseded": True}
+            )
+            nodes.append(retired)
+            edges.append(
+                MemoryEdge(
+                    source_id=procedure.id,
+                    target_id=old_node.id,
+                    relation_type="supersedes",
+                )
+            )
+
+        # One atomic write: the new version, the retired flag on the old version,
+        # and the lineage edge land together or not at all.
+        await self._graph.write_batch(nodes, edges)
 
         self._procedures[procedure.id] = procedure
         self._task_type_index[procedure.task_type] = procedure.id
-
-        if existing_id and existing_id != procedure.id:
-            try:
-                await self._graph.add_edge(
-                    MemoryEdge(
-                        source_id=procedure.id,
-                        target_id=existing_id,
-                        relation_type="supersedes",
-                    )
-                )
-            except KeyError:
-                pass
 
         return procedure.id
 
@@ -83,19 +103,26 @@ class ProceduralMemory:
             )
             for node in nodes:
                 proc = await self._reconstruct_procedure(node)
-                if proc and await self._is_active(proc.id):
+                if proc and await self._is_active(node):
                     return proc
 
-        # Structural match: task_type substring in description
+        # Structural match: task_type substring in description. When several
+        # match, prefer the most specific (longest task_type) rather than
+        # whichever the backend's utility ordering happened to surface first.
         nodes = await self._graph.query(
             node_type=MemoryType.PROCEDURAL, limit=100
         )
+        best: Procedure | None = None
+        best_len = -1
         for node in nodes:
             node_task_type = node.metadata.get("task_type", "")
             if node_task_type and node_task_type in task_description:
                 proc = await self._reconstruct_procedure(node)
-                if proc and await self._is_active(proc.id):
-                    return proc
+                if proc and await self._is_active(node) and len(node_task_type) > best_len:
+                    best = proc
+                    best_len = len(node_task_type)
+        if best is not None:
+            return best
 
         # Fallback: similarity search
         query_embedding = await self._embedder.embed(task_description)
@@ -105,7 +132,7 @@ class ProceduralMemory:
 
         for node in similar:
             proc = await self._reconstruct_procedure(node)
-            if proc and await self._is_active(proc.id):
+            if proc and await self._is_active(node):
                 return proc
 
         return None
@@ -155,7 +182,7 @@ class ProceduralMemory:
             proc = await self._reconstruct_procedure(node)
             if proc is None:
                 continue
-            if active_only and not await self._is_active(proc.id):
+            if active_only and not await self._is_active(node):
                 continue
             procedures.append(proc)
         return procedures
@@ -183,11 +210,34 @@ class ProceduralMemory:
         )
 
         self._procedures[node.id] = procedure
-        self._task_type_index[task_type] = node.id
+        # The task_type index tracks the *active* procedure per task_type; a
+        # retired version must not hijack it, or a later register() would
+        # supersede the wrong node and leave two active versions.
+        if not node.metadata.get("superseded"):
+            self._task_type_index[task_type] = node.id
         return procedure
 
-    async def _is_active(self, procedure_id: str) -> bool:
-        return not await self._graph.has_incoming_edge(procedure_id, "supersedes")
+    async def _active_versions(self, task_type: str) -> list[MemoryNode]:
+        """Every active procedure node for a task_type, read from the graph.
+
+        Registration needs an authoritative answer, so it asks the graph rather
+        than the in-process index. Returning *all* active versions (not just one)
+        means a store that already holds duplicates — written before registration
+        consulted the graph — gets healed by the next registration instead of
+        keeping a stray active node that eviction protection would make permanent.
+        """
+        nodes = await self._graph.query(
+            node_type=MemoryType.PROCEDURAL,
+            filters={"task_type": task_type},
+            limit=100,
+        )
+        return [node for node in nodes if await self._is_active(node)]
+
+    async def _is_active(self, node: MemoryNode) -> bool:
+        """Active unless intrinsically tombstoned. Reads the `superseded` flag,
+        never the supersedes edge, so deletion of a superseder can't reactivate
+        a retired version."""
+        return not node.metadata.get("superseded", False)
 
     def _corrective_hints(self, episodes: list[MemoryNode]) -> str:
         """Extract correction text from failure/corrected outcome nodes."""

@@ -1,6 +1,5 @@
 """Tests for Kùzu graph database backend."""
 
-import tempfile
 from pathlib import Path
 
 import pytest

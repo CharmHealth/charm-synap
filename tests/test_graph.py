@@ -27,7 +27,7 @@ async def test_add_edge_validates_nodes(graph: MemoryGraph):
     bad_edge = MemoryEdge(source_id=n1.id, target_id="nonexistent", relation_type="x")
     try:
         await graph.add_edge(bad_edge)
-        assert False, "Should have raised KeyError"
+        raise AssertionError("Should have raised KeyError")
     except KeyError:
         pass
 

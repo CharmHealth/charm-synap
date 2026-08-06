@@ -1,5 +1,21 @@
-"""Engram — Cognitive memory architecture for LLM agents."""
+"""synap — Cognitive memory architecture for LLM agents."""
 
+from synap.bootstrap import Bootstrap, ProposedKnowledge
+from synap.consolidation import ConsolidationConfig, ConsolidationResult
+from synap.episodic import EpisodicMemory, EpisodicPattern
+from synap.facade import CognitiveMemory, EvaluationReport, MemoryStats
+from synap.graph import MemoryGraph
+from synap.persistent_graph import PersistentGraph
+from synap.procedural import ProceduralMemory
+from synap.protocols import (
+    AsyncStorageBackend,
+    EmbeddingProvider,
+    GraphStore,
+    LLMProvider,
+    SemanticDomain,
+    StorageBackend,
+)
+from synap.semantic import SemanticMemory, SemanticResult
 from synap.types import (
     CapacityHints,
     ConsolidationEvent,
@@ -14,24 +30,6 @@ from synap.types import (
     Procedure,
     ToolCall,
 )
-from synap.protocols import (
-    AsyncStorageBackend,
-    EmbeddingProvider,
-    GraphStore,
-    LLMProvider,
-    SemanticDomain,
-    StorageBackend,
-)
-from synap.graph import MemoryGraph
-from synap.persistent_graph import PersistentGraph
-from synap.semantic import SemanticMemory
-from synap.procedural import ProceduralMemory
-from synap.episodic import EpisodicMemory
-from synap.consolidation import ConsolidationConfig, ConsolidationResult
-from synap.episodic import EpisodicPattern
-from synap.semantic import SemanticResult
-from synap.bootstrap import Bootstrap, ProposedKnowledge
-from synap.facade import CognitiveMemory, EvaluationReport, MemoryStats
 
 __all__ = [
     "AsyncStorageBackend",
