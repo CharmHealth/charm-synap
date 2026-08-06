@@ -7,9 +7,13 @@ order happened to surface first.
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from synap.backends.sqlite import SQLiteBackend
 from synap.graph import MemoryGraph
+from synap.persistent_graph import PersistentGraph
 from synap.procedural import ProceduralMemory
-from synap.types import Procedure
+from synap.types import MemoryNode, MemoryType, Procedure
 from tests.conftest import FakeEmbedder
 
 
@@ -54,3 +58,76 @@ async def test_reconstructing_a_retired_version_does_not_hijack_the_index():
     await b._reconstruct_procedure(await graph.get_node(v1.id))  # retired, reconstructed last
 
     assert b._task_type_index["classify"] == v2.id, "retired version hijacked the index"
+
+
+async def test_cold_register_supersedes_the_version_already_in_the_graph():
+    """register() reads the active version from the graph, not from its own index.
+
+    A fresh instance — a process restart against persistent storage, a second
+    instance sharing a graph, or any caller that hasn't run match() first — starts
+    with an empty index. Trusting it would skip the tombstone and leave two nodes
+    reading as active for one task_type, permanently: active procedures are
+    exempt from eviction, so the duplicate never decays away.
+    """
+    graph = MemoryGraph()
+    v1 = _proc("classify")
+    await ProceduralMemory(graph, FakeEmbedder()).register(v1)
+
+    cold = ProceduralMemory(graph, FakeEmbedder())  # empty index, no match() call
+    v2 = _proc("classify")
+    await cold.register(v2)
+
+    active = [p.id for p in await cold.list_procedures(active_only=True)]
+    assert active == [v2.id], f"expected only the new version active, got {active}"
+
+
+async def test_register_retires_every_active_version_it_finds():
+    """A store written before registration consulted the graph can already hold
+    two active versions for one task_type. Registration retires all of them, so
+    the duplicate is healed rather than left permanently un-evictable."""
+    graph = MemoryGraph()
+    proc = ProceduralMemory(graph, FakeEmbedder())
+    for stale_id in ("stale-a", "stale-b"):
+        await graph.add_node(
+            MemoryNode(
+                id=stale_id,
+                content="classify: legacy",
+                node_type=MemoryType.PROCEDURAL,
+                metadata={
+                    "task_type": "classify",
+                    "description": "legacy",
+                    "schema": {},
+                    "field_ordering": ["a"],
+                },
+            )
+        )
+
+    v = _proc("classify")
+    await proc.register(v)
+
+    active = sorted(p.id for p in await proc.list_procedures(active_only=True))
+    assert active == [v.id], f"expected only the new version active, got {active}"
+
+
+async def test_register_after_restart_supersedes_across_persistent_storage(
+    tmp_path: Path,
+):
+    """The same guarantee through a real backend, across a simulated restart:
+    register the first version, close the store, reopen it, register a second
+    version without any intervening read."""
+    db = tmp_path / "procedures.db"
+    v1, v2 = _proc("classify"), _proc("classify")
+
+    backend = SQLiteBackend(db)
+    await ProceduralMemory(PersistentGraph(backend=backend), FakeEmbedder()).register(v1)
+    backend.close()
+
+    backend = SQLiteBackend(db)
+    reopened = ProceduralMemory(PersistentGraph(backend=backend), FakeEmbedder())
+    await reopened.register(v2)
+    try:
+        active = [p.id for p in await reopened.list_procedures(active_only=True)]
+        assert active == [v2.id], f"expected only the new version active, got {active}"
+        assert (await reopened.match("please classify this")).id == v2.id
+    finally:
+        backend.close()

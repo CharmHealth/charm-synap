@@ -28,7 +28,16 @@ class ProceduralMemory:
         self._task_type_index: dict[str, str] = {}
 
     async def register(self, procedure: Procedure) -> str:
-        existing_id = self._task_type_index.get(procedure.task_type)
+        # Read the versions to retire from the graph, not from _task_type_index.
+        # That index is a lazily-seeded cache: a fresh instance starts empty, so
+        # trusting it would let a cold register() skip the tombstone and leave two
+        # nodes active for one task_type — permanently, since active procedures
+        # are exempt from eviction.
+        retiring = [
+            n
+            for n in await self._active_versions(procedure.task_type)
+            if n.id != procedure.id
+        ]
 
         node = MemoryNode(
             content=f"{procedure.task_type}: {procedure.description}",
@@ -50,25 +59,23 @@ class ProceduralMemory:
         )
         nodes = [node]
         edges: list[MemoryEdge] = []
-        if existing_id and existing_id != procedure.id:
-            old_node = await self._graph.get_node(existing_id)
-            if old_node is not None:
-                # Tombstone the retired version intrinsically (status), and keep
-                # the supersedes edge for lineage. Status reads consult the flag,
-                # never the edge, so deleting this new version cannot resurrect
-                # the old one. Write a copy (not the stored node) so a failed
-                # write_batch rolls back cleanly instead of leaving the flag set.
-                retired = replace(
-                    old_node, metadata={**old_node.metadata, "superseded": True}
+        for old_node in retiring:
+            # Tombstone the retired version intrinsically (status), and keep
+            # the supersedes edge for lineage. Status reads consult the flag,
+            # never the edge, so deleting this new version cannot resurrect
+            # the old one. Write a copy (not the stored node) so a failed
+            # write_batch rolls back cleanly instead of leaving the flag set.
+            retired = replace(
+                old_node, metadata={**old_node.metadata, "superseded": True}
+            )
+            nodes.append(retired)
+            edges.append(
+                MemoryEdge(
+                    source_id=procedure.id,
+                    target_id=old_node.id,
+                    relation_type="supersedes",
                 )
-                nodes.append(retired)
-                edges.append(
-                    MemoryEdge(
-                        source_id=procedure.id,
-                        target_id=existing_id,
-                        relation_type="supersedes",
-                    )
-                )
+            )
 
         # One atomic write: the new version, the retired flag on the old version,
         # and the lineage edge land together or not at all.
@@ -209,6 +216,22 @@ class ProceduralMemory:
         if not node.metadata.get("superseded"):
             self._task_type_index[task_type] = node.id
         return procedure
+
+    async def _active_versions(self, task_type: str) -> list[MemoryNode]:
+        """Every active procedure node for a task_type, read from the graph.
+
+        Registration needs an authoritative answer, so it asks the graph rather
+        than the in-process index. Returning *all* active versions (not just one)
+        means a store that already holds duplicates — written before registration
+        consulted the graph — gets healed by the next registration instead of
+        keeping a stray active node that eviction protection would make permanent.
+        """
+        nodes = await self._graph.query(
+            node_type=MemoryType.PROCEDURAL,
+            filters={"task_type": task_type},
+            limit=100,
+        )
+        return [node for node in nodes if await self._is_active(node)]
 
     async def _is_active(self, node: MemoryNode) -> bool:
         """Active unless intrinsically tombstoned. Reads the `superseded` flag,
