@@ -1,6 +1,6 @@
 # Synap
 
-[![CI](https://github.com/veeeceee/synap/actions/workflows/ci.yml/badge.svg)](https://github.com/veeeceee/synap/actions/workflows/ci.yml)
+[![CI](https://github.com/CharmHealth/charm-synap/actions/workflows/ci.yml/badge.svg)](https://github.com/CharmHealth/charm-synap/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/synap)](https://pypi.org/project/synap/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 

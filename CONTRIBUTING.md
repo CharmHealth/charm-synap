@@ -6,8 +6,8 @@ Thanks for your interest in contributing to Synap! This guide will help you get 
 
 ```bash
 # Clone the repo
-git clone https://github.com/veeeceee/synap.git
-cd synap
+git clone https://github.com/CharmHealth/charm-synap.git
+cd charm-synap
 
 # Create a virtual environment and install dev dependencies
 python -m venv .venv
