@@ -126,7 +126,9 @@ When consolidation amends a procedure, the old version stays in the graph with a
 [procedure_v2] --supersedes--> [procedure_v1]
 ```
 
-The active procedure is always the one with no incoming `supersedes` edge.
+Retirement is recorded on the node itself — a `superseded` flag in the old version's metadata — and status is read from that flag, not from the edge. The edge is kept for lineage only. Reading the flag means deleting the newer version does not resurrect the older one.
+
+Registration reads the current active version from the graph rather than from an in-process cache, so a fresh instance over persistent storage still retires the version it finds instead of adding a second active one.
 
 ## The Shared Graph
 
@@ -216,8 +218,11 @@ class SemanticDomain(Protocol):
     async def absorb(
         self, insights: list[str], source_episodes: list[MemoryNode],
         metadata: dict[str, Any] | None = None,
+        node_id: str | None = None,
     ) -> str | None: ...
 ```
+
+`node_id` was added in 0.2.0. Consolidation passes it on every call, so an adapter written against the 0.1.0 three-argument signature raises `TypeError` the first time consolidation runs — and because `ConsolidationEngine.process()` converts exceptions into a failed `ConsolidationResult`, that surfaces as consolidation quietly doing nothing rather than as a crash. Accept the parameter when upgrading. When it is set, store the insight under that id, replacing an existing node with the same id (this is how repeated consolidation of one pattern yields a single fact instead of near-duplicates); when it is `None`, mint your own id.
 
 `SemanticMemory` is the built-in generic implementation — text nodes with embeddings and graph traversal. Use it to get started, replace it when your domain needs custom types.
 

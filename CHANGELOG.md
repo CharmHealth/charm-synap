@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ConsolidationEngine.run_periodic()` queries the graph instead of accessing internal episodic state
 - `PersistentGraph.node_count()` and `edge_count()` delegate to backend-native counts instead of loading all rows
 - **Breaking:** the utility score now gates frequency by recency — `recency * (1 + frequency_bonus)` instead of `recency + frequency_bonus` — so a cold node becomes evictable regardless of access count; `utility_score` values and eviction timing change. `update_utility` now decays from `last_accessed` rather than creation time
+- **Breaking:** `SemanticDomain.absorb()` takes a fourth argument, `node_id: str | None = None`, and consolidation passes it on every call. Custom domain adapters written against the 0.1.0 three-argument signature raise `TypeError` when consolidation runs; since `ConsolidationEngine.process()` turns exceptions into a failed `ConsolidationResult`, this shows up as consolidation silently doing nothing rather than as a crash. Adapters should accept the parameter and, when it is set, store the insight under that id (replacing any existing node with the same id) — that is what makes repeated consolidation of one pattern converge on a single fact
 - **Breaking:** MCP server environment variables renamed from `ENGRAM_*` to `SYNAP_*` (`SYNAP_DB`, `SYNAP_EMBEDDING_DIM`, `SYNAP_HOST`, `SYNAP_PORT`)
 - Active procedures are never evicted while active; retired (superseded) procedures and other node types still evict normally
 - Retirement is recorded intrinsically — a `superseded` flag on procedures, `valid_until` on semantic facts — and read instead of the `supersedes` edge, so deleting a superseder no longer resurrects the old version
@@ -40,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `SQLiteBackend` works with `PersistentGraph`'s threaded dispatch — it opened its connection with `check_same_thread=True` and crashed on the first write off the constructing thread
 - Consolidating the same recurring pattern now yields one fact instead of near-duplicates (deterministic id from a stable pattern key); a re-consolidation preserves an existing fact's retirement and lifecycle instead of resurrecting it
 - A procedure is no longer re-amended — churning versions and inserting duplicate fields — for a failure pattern it has already absorbed
+- `ProceduralMemory.register()` reads the version to retire from the graph instead of from its in-process index. The index starts empty on a fresh instance, so registering from a process restart, a second instance sharing a graph, or any caller that hadn't run `match()` first left two procedures active for one task type — and since active procedures are exempt from eviction, the duplicate never decayed away. Registration also retires every active version it finds, so a store that already holds duplicates is healed on the next registration
 - The installed wheel no longer imports test code, so `python -m synap.mcp_server` runs from a clean install
 
 ### Added
