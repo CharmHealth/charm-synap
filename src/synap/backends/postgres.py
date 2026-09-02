@@ -41,9 +41,13 @@ def _coerce_timestamp_optional(value: Any) -> datetime | None:
     return _coerce_timestamp(value)
 
 
-_SCHEMA_SQL = """
-CREATE EXTENSION IF NOT EXISTS vector;
+# Separate from _SCHEMA_SQL so a privilege failure here can be reported for what
+# it is. On managed Postgres the application role is not a superuser and cannot
+# create extensions; init() turns that into an actionable message rather than a
+# bare "permission denied" from somewhere inside startup.
+_EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
 
+_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS {prefix}nodes (
     id TEXT PRIMARY KEY,
     node_type TEXT NOT NULL,
@@ -60,6 +64,24 @@ CREATE TABLE IF NOT EXISTS {prefix}nodes (
 
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_type ON {prefix}nodes(node_type);
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_utility ON {prefix}nodes(utility_score);
+
+-- The index the similarity search actually needs. search_similar orders by
+-- `embedding <=> $1::vector` (cosine distance), and without an index for that
+-- operator every search is a sequential scan computing a distance for every
+-- node in the graph — which is exactly the query the graph exists to serve.
+--
+-- vector_cosine_ops because the query uses <=>. An l2 index cannot answer it:
+-- the planner will not use an operator class that does not match the operator,
+-- so a mismatch here fails open as a full scan and nothing errors.
+--
+-- hnsw rather than ivfflat because a new deployment starts empty. ivfflat
+-- builds its lists by clustering the rows present at build time, so an index
+-- created against an empty table has nothing to cluster and stays useless
+-- until someone rebuilds it after data arrives. hnsw builds incrementally and
+-- is correct from zero rows, at the cost of more memory and slower inserts.
+-- Bounded by pgvector's 2000-dimension limit for hnsw; Titan Embed v2 is 1024.
+CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_embedding
+    ON {prefix}nodes USING hnsw (embedding vector_cosine_ops);
 
 -- Forward-migrate a store created before these columns existed (idempotent).
 -- Additive-only; a versioned migration path is ROADMAP task 7.
@@ -111,6 +133,23 @@ class PostgresBackend:
     async def init(self) -> None:
         """Create tables and indexes. Idempotent — safe to call on every startup."""
         async with self._pool.acquire() as conn:
+            try:
+                await conn.execute(_EXTENSION_SQL)
+            except asyncpg.InsufficientPrivilegeError as exc:
+                # Verified against Postgres 14: a non-superuser running
+                # `CREATE EXTENSION IF NOT EXISTS vector` SUCCEEDS when the
+                # extension is already installed (NOTICE, skipping) and fails
+                # with 42501 only when it has to create it. So this is a
+                # one-time provisioning step, not an ongoing privilege the
+                # application role needs.
+                raise RuntimeError(
+                    "pgvector is not installed in this database and this role "
+                    "cannot install it. An administrator must run "
+                    "'CREATE EXTENSION vector;' against this database once, "
+                    "before synap first starts — on RDS or Aurora that means a "
+                    "role with rds_superuser. The application role needs no "
+                    "extension privileges once it exists."
+                ) from exc
             await conn.execute(
                 _SCHEMA_SQL.format(prefix=self._prefix, dim=self._dim)
             )
