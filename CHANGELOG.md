@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `StorageBackend.node_count()` and `edge_count()` — efficient count queries for Kuzu and SQLite backends
 - Shared `_utils.cosine_similarity()` — deduplicated from graph, episodic, and sqlite modules
 - Offline placeholder providers (`HashEmbedder`, `PlaceholderLLM`) in `synap.providers`, so the library and MCP server run with no external services
+- An hnsw index on the Postgres backend's `embedding` column, using `vector_cosine_ops` to match the `<=>` operator `search_similar` orders by. Without it every similarity search was a sequential scan over all nodes
 
 ## [0.1.0] - 2026-03-17
 
