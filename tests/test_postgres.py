@@ -456,3 +456,19 @@ async def test_the_planner_uses_that_index_for_the_search_query(db: PostgresBack
     assert "Index Scan" in plan, plan
     assert "embedding <=>" in plan, plan
     assert "Seq Scan" not in plan, plan
+
+async def test_a_dimension_over_the_hnsw_limit_is_refused_at_construction(db: PostgresBackend):
+    """The ceiling is new, so it needs to fail where a reader can see why.
+
+    Before the hnsw index existed any dimension worked, because nothing
+    indexed the column. Now a dimension over pgvector's limit cannot have an
+    index built for it — and the alternative to refusing is a store that
+    silently has no similarity index, which is what the index was added to fix.
+    """
+    from synap.backends.postgres import HNSW_MAX_DIM
+
+    with pytest.raises(ValueError, match="hnsw limit"):
+        PostgresBackend(db._pool, embedding_dim=HNSW_MAX_DIM + 1, table_prefix="x_")
+
+    # The limit itself is allowed — the check is an upper bound, not an exclusion.
+    PostgresBackend(db._pool, embedding_dim=HNSW_MAX_DIM, table_prefix="x_")

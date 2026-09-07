@@ -53,6 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `_utils.cosine_similarity()` — deduplicated from graph, episodic, and sqlite modules
 - Offline placeholder providers (`HashEmbedder`, `PlaceholderLLM`) in `synap.providers`, so the library and MCP server run with no external services
 - An hnsw index on the Postgres backend's `embedding` column, using `vector_cosine_ops` to match the `<=>` operator `search_similar` orders by. Without it every similarity search was a sequential scan over all nodes
+- `PostgresBackend` now refuses an `embedding_dim` above 2000 at construction, with the limit named. pgvector's hnsw index caps there, so a larger dimension could not have an index built for it — previously any dimension worked because nothing indexed the column
+- Clearer failures when pgvector is missing or too old: a missing extension control file (the extension is not installed on the server, which no privilege fixes) and a missing hnsw access method (pgvector older than 0.5.0) each say what is actually wrong instead of surfacing a raw driver error
 
 ## [0.1.0] - 2026-03-17
 

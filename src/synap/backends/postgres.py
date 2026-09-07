@@ -47,6 +47,20 @@ def _coerce_timestamp_optional(value: Any) -> datetime | None:
 # bare "permission denied" from somewhere inside startup.
 _EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
 
+# pgvector's hnsw index accepts at most 2000 dimensions for the `vector` type.
+# Checked at construction rather than at index-creation time because otherwise
+# the failure lands a long way from its cause: a 3072-dimension model (OpenAI's
+# text-embedding-3-large, for one) would get a raw asyncpg error out of init()
+# and the backend would never start, with nothing naming the dimension as the
+# problem.
+#
+# This is a new ceiling. Before the hnsw index existed, any dimension worked
+# because nothing indexed the column. Refusing here rather than skipping the
+# index is deliberate: a store that silently has no similarity index is the
+# exact failure this index was added to fix, so it is better to refuse the
+# configuration than to honour it without the index.
+HNSW_MAX_DIM = 2000
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS {prefix}nodes (
     id TEXT PRIMARY KEY,
@@ -124,6 +138,13 @@ class PostgresBackend:
         embedding_dim: int = 1536,
         table_prefix: str = "synap_",
     ) -> None:
+        if embedding_dim > HNSW_MAX_DIM:
+            raise ValueError(
+                f"embedding_dim={embedding_dim} exceeds pgvector's hnsw limit "
+                f"of {HNSW_MAX_DIM} dimensions, so the similarity index this "
+                "backend creates cannot be built. Use a model with fewer "
+                "dimensions, or reduce the vector before storing it."
+            )
         self._pool = pool
         self._dim = embedding_dim
         self._prefix = table_prefix
@@ -150,9 +171,36 @@ class PostgresBackend:
                     "role with rds_superuser. The application role needs no "
                     "extension privileges once it exists."
                 ) from exc
-            await conn.execute(
-                _SCHEMA_SQL.format(prefix=self._prefix, dim=self._dim)
-            )
+            except asyncpg.UndefinedFileError as exc:
+                # 58P01. Distinct from the privilege case above and much more
+                # common: the extension's control file is not on the server at
+                # all, so no role can create it and the advice to find an
+                # administrator is wrong. A plain `postgres` image has no
+                # pgvector; RDS, Aurora and pgvector/pgvector all ship it.
+                raise RuntimeError(
+                    "pgvector is not installed on this Postgres server — its "
+                    "extension control file is missing, so no role can create "
+                    "it and this is not a permissions problem. Install the "
+                    "server package (postgresql-<version>-pgvector), or use an "
+                    "image that ships it: pgvector/pgvector, or RDS/Aurora."
+                ) from exc
+            try:
+                await conn.execute(
+                    _SCHEMA_SQL.format(prefix=self._prefix, dim=self._dim)
+                )
+            except asyncpg.UndefinedObjectError as exc:
+                # 42704. In this statement the only object that can be
+                # undefined is the hnsw access method: the `vector` type itself
+                # would have failed at CREATE EXTENSION above, and everything
+                # else here is built-in. hnsw arrived in pgvector 0.5.0, so an
+                # older extension reaches this line and fails on the index.
+                raise RuntimeError(
+                    "This server's pgvector is too old to build the similarity "
+                    "index — the hnsw access method was added in pgvector "
+                    "0.5.0. Run 'ALTER EXTENSION vector UPDATE;', or upgrade "
+                    "the server package if the installed version is already "
+                    "the newest available."
+                ) from exc
 
     # --- Node operations ---
 
