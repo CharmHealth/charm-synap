@@ -24,10 +24,10 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/veeeceee/synap"
-Repository = "https://github.com/veeeceee/synap"
-Issues = "https://github.com/veeeceee/synap/issues"
-Changelog = "https://github.com/veeeceee/synap/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/CharmHealth/charm-synap"
+Repository = "https://github.com/CharmHealth/charm-synap"
+Issues = "https://github.com/CharmHealth/charm-synap/issues"
+Changelog = "https://github.com/CharmHealth/charm-synap/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 kuzu = ["kuzu>=0.8.0"]
