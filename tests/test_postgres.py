@@ -411,3 +411,64 @@ async def test_persistence_across_backend_instances(db: PostgresBackend):
     loaded = await other.load_node("n1")
     assert loaded is not None
     assert loaded["content"] == "test fact"
+
+
+# --- Vector index (J8) ---
+
+
+async def test_init_creates_an_hnsw_index_on_the_embedding(db: PostgresBackend):
+    """Without an index for `<=>`, every similarity search scans every node."""
+    # Looked up by definition rather than by name: Postgres truncates
+    # identifiers at 63 bytes, and this suite's per-test table prefix is long
+    # enough to clip the tail off the intended name.
+    async with db._pool.acquire() as conn:
+        definition = await conn.fetchval(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename = $1 AND indexdef LIKE '%(embedding%'",
+            f"{db._prefix}nodes",
+        )
+    assert definition is not None, "no index was created on the embedding column"
+    assert "USING hnsw" in definition, definition
+    # vector_cosine_ops, because search_similar orders by <=>. An l2 index looks
+    # perfectly healthy in pg_indexes and simply never gets used.
+    assert "vector_cosine_ops" in definition, definition
+
+
+async def test_the_planner_uses_that_index_for_the_search_query(db: PostgresBackend):
+    """Proves the operator class matches the operator the backend actually uses.
+
+    This is the assertion that catches a wrong opclass. An index built with
+    vector_l2_ops exists, reports healthy, and cannot answer an ORDER BY on
+    `<=>` — the planner just falls back to a sequential scan and nothing errors.
+    Turning seqscan off makes the difference observable: a usable index shows up
+    in the plan, a mismatched one leaves a Seq Scan behind.
+    """
+    await db.save_node(_make_node("n1", embedding=[1.0, 0.0, 0.0]))
+    async with db._pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            rows = await conn.fetch(
+                f"EXPLAIN SELECT id FROM {db._prefix}nodes "
+                f"ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 5"
+            )
+    plan = "\n".join(r["QUERY PLAN"] for r in rows)
+    # Not asserted by index name — see the note in the test above.
+    assert "Index Scan" in plan, plan
+    assert "embedding <=>" in plan, plan
+    assert "Seq Scan" not in plan, plan
+
+async def test_a_dimension_over_the_hnsw_limit_is_refused_at_construction(db: PostgresBackend):
+    """The ceiling is new, so it needs to fail where a reader can see why.
+
+    Before the hnsw index existed any dimension worked, because nothing
+    indexed the column. Now a dimension over pgvector's limit cannot have an
+    index built for it — and the alternative to refusing is a store that
+    silently has no similarity index, which is what the index was added to fix.
+    """
+    from synap.backends.postgres import HNSW_MAX_DIM
+
+    with pytest.raises(ValueError, match="hnsw limit"):
+        PostgresBackend(db._pool, embedding_dim=HNSW_MAX_DIM + 1, table_prefix="x_")
+
+    # The limit itself is allowed — the check is an upper bound, not an exclusion.
+    PostgresBackend(db._pool, embedding_dim=HNSW_MAX_DIM, table_prefix="x_")
