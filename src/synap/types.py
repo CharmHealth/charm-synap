@@ -50,6 +50,9 @@ class MemoryNode:
     embedding: list[float] | None = None
     valid_from: datetime | None = None
     valid_until: datetime | None = None
+    # Owning tenant; None is the untenanted namespace. Set by the graph a
+    # node is written through (see synap.tenancy), not by subsystems.
+    tenant: str | None = None
 
     def touch(self) -> None:
         """Record an access — updates recency and count."""

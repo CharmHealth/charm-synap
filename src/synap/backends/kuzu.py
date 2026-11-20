@@ -10,6 +10,8 @@ from typing import Any
 
 import kuzu
 
+from synap.tenancy import ALL_TENANTS, TenantFilter, TenantMismatchError
+
 # ---------------------------------------------------------------------------
 # Schema constants
 # ---------------------------------------------------------------------------
@@ -43,6 +45,32 @@ CREATE REL TABLE IF NOT EXISTS MemoryEdge(
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _node_return(var: str = "n") -> str:
+    """RETURN list for a node, in _row_to_node's column order."""
+    return (
+        f"{var}.id, {var}.node_type, {var}.content, {var}.embedding, "
+        f"{var}.utility_score, {var}.access_count, "
+        f"{var}.created_at, {var}.last_accessed, {var}.metadata, "
+        f"{var}.valid_from, {var}.valid_until, {var}.tenant"
+    )
+
+
+def _tenant_condition(
+    var: str, tenant: TenantFilter, params: dict[str, Any]
+) -> str | None:
+    """Cypher predicate for a tenant filter, adding any bind to ``params``."""
+    if tenant is ALL_TENANTS:
+        return None
+    if tenant is None:
+        return f"{var}.tenant IS NULL"
+    params["tenant"] = tenant
+    return f"{var}.tenant = $tenant"
+
+
+def _where(conditions: list[str]) -> str:
+    return f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
 
 class KuzuBackend:
@@ -102,7 +130,7 @@ class KuzuBackend:
         # Forward-migrate a store created before a column existed. Kuzu's
         # ALTER ... ADD has no IF NOT EXISTS, so swallow the "already exists"
         # error. Additive-only; a versioned migration path is ROADMAP task 7.
-        for column in ("valid_from", "valid_until"):
+        for column in ("valid_from", "valid_until", "tenant"):
             try:
                 conn.execute(f"ALTER TABLE MemoryNode ADD {column} STRING")
             except RuntimeError:
@@ -133,6 +161,41 @@ class KuzuBackend:
         """Upsert one node on the given connection (dim-checked embedding)."""
         embedding = node.get("embedding")
         embedding_val = self._format_embedding(embedding) if embedding else None
+        tenant = node.get("tenant")
+        # MERGE matches on id alone, so an id that already exists under another
+        # tenant would be overwritten and moved. Refuse it instead.
+        #
+        # This precheck and the MERGE below are two separate statements, so
+        # there is a TOCTOU race: another connection can CREATE the same id
+        # under a different tenant between them, and this MERGE would then
+        # hit ON MATCH (silently skipping the check) and overwrite that row's
+        # content/metadata — the tenant column itself is only ever set in
+        # ON CREATE, so a race can't move a node to a different tenant, but it
+        # can still let one tenant's write land on another tenant's node.
+        #
+        # Not fixed here: Kuzu allows only one write transaction in the whole
+        # database at a time (confirmed empirically — a second connection's
+        # BEGIN TRANSACTION while one is open raises immediately rather than
+        # queuing), so wrapping this precheck+MERGE pair in an explicit
+        # transaction would turn concurrent writers that work fine today into
+        # ones that intermittently raise, which needs retry-on-conflict logic
+        # on every caller to not be a regression. Given how this is actually
+        # reached (two different tenants racing to create the very same node
+        # id — practically only possible with a caller-supplied, not
+        # library-generated, id, since consolidated fact ids now include the
+        # tenant), that trade isn't worth making blind. If this needs closing,
+        # do it with a retry loop around a real transaction, verified under
+        # concurrent load, not as a drive-by here.
+        existing = conn.execute(
+            "MATCH (n:MemoryNode {id: $id}) RETURN n.tenant",
+            parameters={"id": node["id"]},
+        )
+        assert not isinstance(existing, list)
+        if existing.has_next() and existing.get_next()[0] != tenant:
+            raise TenantMismatchError(
+                f"node {node['id']!r} belongs to a different tenant; "
+                "refusing to overwrite it"
+            )
         conn.execute(
             """
             MERGE (n:MemoryNode {id: $id})
@@ -146,7 +209,8 @@ class KuzuBackend:
                 n.last_accessed = $last_accessed,
                 n.metadata = $metadata,
                 n.valid_from = $valid_from,
-                n.valid_until = $valid_until
+                n.valid_until = $valid_until,
+                n.tenant = $tenant
             ON MATCH SET
                 n.node_type = $node_type,
                 n.content = $content,
@@ -170,6 +234,7 @@ class KuzuBackend:
                 "metadata": json.dumps(node.get("metadata", {})),
                 "valid_from": node.get("valid_from"),
                 "valid_until": node.get("valid_until"),
+                "tenant": tenant,
             },
         )
 
@@ -189,10 +254,7 @@ class KuzuBackend:
         result = self._conn().execute(
             """
             MATCH (n:MemoryNode {id: $id})
-            RETURN n.id, n.node_type, n.content, n.embedding,
-                   n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata,
-                   n.valid_from, n.valid_until
+            RETURN """ + _node_return() + """
             """,
             parameters={"id": node_id},
         )
@@ -288,19 +350,25 @@ class KuzuBackend:
         node_type: str | None = None,
         filters: dict[str, Any] | None = None,
         limit: int = 100,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
         conn = self._conn()
 
-        where = ""
+        conditions: list[str] = []
         params: dict[str, Any] = {}
         if node_type:
-            where = "WHERE n.node_type = $ntype"
+            conditions.append("n.node_type = $ntype")
             params["ntype"] = node_type
+        tenant_cond = _tenant_condition("n", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
 
         # Metadata filters are applied in Python after rows materialize. When
         # they are present the LIMIT must apply *after* filtering (parity with
         # the Postgres pushdown), so we fetch the ordered candidate set here and
         # truncate below rather than letting Cypher limit pre-filter rows.
+        # The tenant filter is in the Cypher WHERE, so it always applies first.
         if filters:
             limit_clause = ""
         else:
@@ -310,11 +378,8 @@ class KuzuBackend:
         result = conn.execute(
             f"""
             MATCH (n:MemoryNode)
-            {where}
-            RETURN n.id, n.node_type, n.content, n.embedding,
-                   n.utility_score, n.access_count,
-                   n.created_at, n.last_accessed, n.metadata,
-                   n.valid_from, n.valid_until
+            {_where(conditions)}
+            RETURN {_node_return()}
             ORDER BY n.utility_score DESC
             {limit_clause}
             """,
@@ -335,9 +400,23 @@ class KuzuBackend:
 
         return nodes
 
+    def list_tenants(self) -> list[str]:
+        """Every tenant that owns at least one node (untenanted excluded)."""
+        result = self._conn().execute(
+            "MATCH (n:MemoryNode) WHERE n.tenant IS NOT NULL "
+            "RETURN DISTINCT n.tenant ORDER BY n.tenant"
+        )
+        return [r[0] for r in self._collect_rows(result)]
+
     # --- Server-side decay & evict ---
 
-    def decay_all_scores(self, decay_rate: float, now_epoch_ms: int) -> None:
+    def decay_all_scores(
+        self,
+        decay_rate: float,
+        now_epoch_ms: int,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
+    ) -> None:
         """Recompute utility_score for all nodes in a single Cypher SET.
 
         Runs entirely server-side — no node data leaves the DB.
@@ -345,9 +424,12 @@ class KuzuBackend:
         (``pow(1 - rate, hours)``) multiplied by ``1 + frequency_bonus`` so a
         cold node scores ~0 regardless of how often it was accessed.
         """
+        params: dict[str, Any] = {"now_ms": now_epoch_ms, "rate": decay_rate}
+        tenant_cond = _tenant_condition("n", tenant, params)
         self._conn().execute(
-            """
+            f"""
             MATCH (n:MemoryNode)
+            {_where([tenant_cond] if tenant_cond else [])}
             WITH n,
                  (cast($now_ms as DOUBLE)
                   - cast(to_epoch_ms(cast(n.last_accessed as TIMESTAMP)) as DOUBLE))
@@ -361,10 +443,7 @@ class KuzuBackend:
                               THEN cast(n.access_count AS DOUBLE) / 20.0
                               ELSE 1.0 END)
             """,
-            parameters={
-                "now_ms": now_epoch_ms,
-                "rate": decay_rate,
-            },
+            parameters=params,
         )
 
     # --- Delete ---
@@ -420,31 +499,45 @@ class KuzuBackend:
 
     # --- Counts ---
 
-    def node_count(self, node_type: str | None = None) -> int:
-        conn = self._conn()
+    def node_count(
+        self, node_type: str | None = None, *, tenant: TenantFilter = ALL_TENANTS
+    ) -> int:
+        conditions: list[str] = []
+        params: dict[str, Any] = {}
         if node_type:
-            result = conn.execute(
-                "MATCH (n:MemoryNode) WHERE n.node_type = $ntype RETURN count(n)",
-                parameters={"ntype": node_type},
-            )
-        else:
-            result = conn.execute(
-                "MATCH (n:MemoryNode) RETURN count(n)"
-            )
+            conditions.append("n.node_type = $ntype")
+            params["ntype"] = node_type
+        tenant_cond = _tenant_condition("n", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+        result = self._conn().execute(
+            f"MATCH (n:MemoryNode) {_where(conditions)} RETURN count(n)",
+            parameters=params,
+        )
         assert not isinstance(result, list)  # single statement -> one QueryResult
         return result.get_next()[0] if result.has_next() else 0
 
-    def edge_count(self, relation_type: str | None = None) -> int:
-        conn = self._conn()
+    def edge_count(
+        self,
+        relation_type: str | None = None,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
+    ) -> int:
+        # An edge belongs to its source node's tenant; edges never join two
+        # tenants (the graph layer refuses that write).
+        conditions: list[str] = []
+        params: dict[str, Any] = {}
         if relation_type:
-            result = conn.execute(
-                "MATCH ()-[e:MemoryEdge]->() WHERE e.relation_type = $rtype RETURN count(e)",
-                parameters={"rtype": relation_type},
-            )
-        else:
-            result = conn.execute(
-                "MATCH ()-[e:MemoryEdge]->() RETURN count(e)"
-            )
+            conditions.append("e.relation_type = $rtype")
+            params["rtype"] = relation_type
+        tenant_cond = _tenant_condition("s", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+        result = self._conn().execute(
+            f"MATCH (s:MemoryNode)-[e:MemoryEdge]->() {_where(conditions)} "
+            "RETURN count(e)",
+            parameters=params,
+        )
         assert not isinstance(result, list)  # single statement -> one QueryResult
         return result.get_next()[0] if result.has_next() else 0
 
@@ -455,6 +548,8 @@ class KuzuBackend:
         embedding: list[float],
         node_type: str | None = None,
         limit: int = 10,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
         """Native cosine similarity via Kùzu's array_cosine_similarity."""
         if len(embedding) != self._embedding_dim:
@@ -463,45 +558,29 @@ class KuzuBackend:
                 f"configured for {self._embedding_dim}"
             )
         cast_expr = f"cast($emb, 'DOUBLE[{self._embedding_dim}]')"
-        conn = self._conn()
-
+        conditions = ["n.embedding IS NOT NULL"]
+        params: dict[str, Any] = {
+            "emb": [float(x) for x in embedding],
+            "lim": limit,
+        }
         if node_type:
-            result = conn.execute(
-                f"""
-                MATCH (n:MemoryNode)
-                WHERE n.node_type = $ntype AND n.embedding IS NOT NULL
-                WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
-                RETURN n.id, n.node_type, n.content, n.embedding,
-                       n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata,
-                       n.valid_from, n.valid_until, sim
-                ORDER BY sim DESC
-                LIMIT $lim
-                """,
-                parameters={
-                    "ntype": node_type,
-                    "emb": [float(x) for x in embedding],
-                    "lim": limit,
-                },
-            )
-        else:
-            result = conn.execute(
-                f"""
-                MATCH (n:MemoryNode)
-                WHERE n.embedding IS NOT NULL
-                WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
-                RETURN n.id, n.node_type, n.content, n.embedding,
-                       n.utility_score, n.access_count,
-                       n.created_at, n.last_accessed, n.metadata,
-                       n.valid_from, n.valid_until, sim
-                ORDER BY sim DESC
-                LIMIT $lim
-                """,
-                parameters={
-                    "emb": [float(x) for x in embedding],
-                    "lim": limit,
-                },
-            )
+            conditions.append("n.node_type = $ntype")
+            params["ntype"] = node_type
+        tenant_cond = _tenant_condition("n", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+
+        result = self._conn().execute(
+            f"""
+            MATCH (n:MemoryNode)
+            {_where(conditions)}
+            WITH n, array_cosine_similarity(n.embedding, {cast_expr}) AS sim
+            RETURN {_node_return()}, sim
+            ORDER BY sim DESC
+            LIMIT $lim
+            """,
+            parameters=params,
+        )
 
         return [self._row_to_node(r) for r in self._collect_rows(result)]
 
@@ -514,6 +593,8 @@ class KuzuBackend:
         max_depth: int = 2,
         max_nodes: int = 50,
         min_weight: float = 0.0,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
         """BFS traversal from a start node using Cypher variable-length paths.
 
@@ -542,16 +623,20 @@ class KuzuBackend:
         else:
             rel_pattern = f"[:MemoryEdge*1..{max_depth}]"
 
+        # Filtering the reached nodes is enough for isolation: edges never
+        # join two tenants (the graph layer refuses that write).
+        neighbor_conditions = ["neighbor.id <> $start"]
+        tenant_cond = _tenant_condition("neighbor", tenant, params)
+        if tenant_cond:
+            neighbor_conditions.append(tenant_cond)
+
         result = self._conn().execute(
             f"""
             MATCH (start:MemoryNode {{id: $start}})
             MATCH (start)-{rel_pattern}-(neighbor:MemoryNode)
-            WHERE neighbor.id <> $start
+            {_where(neighbor_conditions)}
             WITH DISTINCT neighbor
-            RETURN neighbor.id, neighbor.node_type, neighbor.content, neighbor.embedding,
-                   neighbor.utility_score, neighbor.access_count,
-                   neighbor.created_at, neighbor.last_accessed, neighbor.metadata,
-                   neighbor.valid_from, neighbor.valid_until
+            RETURN {_node_return("neighbor")}
             LIMIT $lim
             """,
             parameters=params,
@@ -586,6 +671,7 @@ class KuzuBackend:
             "metadata": json.loads(row[8]) if isinstance(row[8], str) else row[8],
             "valid_from": row[9] if len(row) > 9 else None,
             "valid_until": row[10] if len(row) > 10 else None,
+            "tenant": row[11] if len(row) > 11 else None,
         }
 
     def _row_to_edge(self, row: list) -> dict[str, Any]:

@@ -8,6 +8,36 @@ from typing import Any
 
 import asyncpg
 
+from synap.tenancy import ALL_TENANTS, TenantFilter, TenantMismatchError
+
+
+# Columns every node read returns, in _row_to_node's shape. `alias` prefixes
+# each column for queries that join (traverse).
+def _node_columns(alias: str = "") -> str:
+    p = f"{alias}." if alias else ""
+    return (
+        f"{p}id, {p}node_type, {p}content, {p}embedding::text, "
+        f"{p}utility_score, {p}access_count, "
+        f"{p}created_at::text, {p}last_accessed::text, {p}metadata, "
+        f"{p}valid_from::text, {p}valid_until::text, {p}tenant"
+    )
+
+
+def _tenant_condition(
+    column: str, tenant: TenantFilter, params: list[Any]
+) -> str | None:
+    """SQL predicate for a tenant filter, appending any bind to ``params``.
+
+    None for ALL_TENANTS (no predicate). Untenanted is ``IS NULL`` rather than
+    ``= NULL``, which would match nothing.
+    """
+    if tenant is ALL_TENANTS:
+        return None
+    if tenant is None:
+        return f"{column} IS NULL"
+    params.append(tenant)
+    return f"{column} = ${len(params)}"
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -102,6 +132,13 @@ CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_embedding
 ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_from TIMESTAMPTZ;
 ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS valid_until TIMESTAMPTZ;
 
+-- Owning tenant (NULL = untenanted namespace); see synap.tenancy. Every scoped
+-- read filters on it, so it leads the composite index with node_type, the
+-- other column nearly every read constrains.
+ALTER TABLE {prefix}nodes ADD COLUMN IF NOT EXISTS tenant TEXT;
+CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_tenant_type
+    ON {prefix}nodes(tenant, node_type);
+
 CREATE TABLE IF NOT EXISTS {prefix}edges (
     id TEXT PRIMARY KEY,
     source_id TEXT NOT NULL REFERENCES {prefix}nodes(id) ON DELETE CASCADE,
@@ -150,6 +187,9 @@ class PostgresBackend:
         self._prefix = table_prefix
         self._nodes = f"{table_prefix}nodes"
         self._edges = f"{table_prefix}edges"
+        # Set by init(): whether pgvector supports iterative index scans
+        # (0.8.0+). See similarity_search for why a tenant filter needs them.
+        self._iterative_scan = False
 
     async def init(self) -> None:
         """Create tables and indexes. Idempotent — safe to call on every startup."""
@@ -201,6 +241,10 @@ class PostgresBackend:
                     "the server package if the installed version is already "
                     "the newest available."
                 ) from exc
+            version = await conn.fetchval(
+                "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+            )
+            self._iterative_scan = _version_at_least(version, (0, 8))
 
     # --- Node operations ---
 
@@ -208,14 +252,14 @@ class PostgresBackend:
         """Upsert one node on the given connection (for save_node and batches)."""
         embedding = node.get("embedding")
         embedding_str = _format_vector(embedding) if embedding else None
-        await conn.execute(
+        status = await conn.execute(
             f"""
             INSERT INTO {self._nodes}
                 (id, node_type, content, embedding, utility_score,
                  access_count, created_at, last_accessed, metadata,
-                 valid_from, valid_until)
+                 valid_from, valid_until, tenant)
             VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
-                    $10::timestamptz, $11::timestamptz)
+                    $10::timestamptz, $11::timestamptz, $12)
             ON CONFLICT (id) DO UPDATE SET
                 node_type = EXCLUDED.node_type,
                 content = EXCLUDED.content,
@@ -226,6 +270,7 @@ class PostgresBackend:
                 metadata = EXCLUDED.metadata,
                 valid_from = EXCLUDED.valid_from,
                 valid_until = EXCLUDED.valid_until
+            WHERE {self._nodes}.tenant IS NOT DISTINCT FROM EXCLUDED.tenant
             """,
             node["id"],
             node["node_type"],
@@ -238,7 +283,16 @@ class PostgresBackend:
             json.dumps(node.get("metadata", {})),
             _coerce_timestamp_optional(node.get("valid_from")),
             _coerce_timestamp_optional(node.get("valid_until")),
+            node.get("tenant"),
         )
+        # "INSERT 0 0": the id exists under another tenant and the WHERE above
+        # refused the update. Silently dropping the write would lose data;
+        # applying it would move or overwrite another tenant's node.
+        if status == "INSERT 0 0":
+            raise TenantMismatchError(
+                f"node {node['id']!r} belongs to a different tenant; "
+                "refusing to overwrite it"
+            )
 
     async def save_node(self, node: dict[str, Any]) -> None:
         async with self._pool.acquire() as conn:
@@ -247,13 +301,7 @@ class PostgresBackend:
     async def load_node(self, node_id: str) -> dict[str, Any] | None:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
-                f"""
-                SELECT id, node_type, content, embedding::text,
-                       utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata,
-                       valid_from::text, valid_until::text
-                FROM {self._nodes} WHERE id = $1
-                """,
+                f"SELECT {_node_columns()} FROM {self._nodes} WHERE id = $1",
                 node_id,
             )
         if row is None:
@@ -331,65 +379,94 @@ class PostgresBackend:
         node_type: str | None = None,
         filters: dict[str, Any] | None = None,
         limit: int = 100,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
-        conditions = ["1=1"]
+        conditions: list[str] = []
         params: list[Any] = []
-        idx = 1
 
         if node_type:
-            conditions.append(f"node_type = ${idx}")
             params.append(node_type)
-            idx += 1
+            conditions.append(f"node_type = ${len(params)}")
 
         if filters:
-            conditions.append(f"metadata @> ${idx}::jsonb")
             params.append(json.dumps(filters))
-            idx += 1
+            conditions.append(f"metadata @> ${len(params)}::jsonb")
 
-        conditions.append(f"LIMIT ${idx}")
+        tenant_cond = _tenant_condition("tenant", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+
+        where = " AND ".join(conditions) if conditions else "TRUE"
         params.append(limit)
-
-        where = " AND ".join(conditions[:-1])
-        limit_clause = conditions[-1]
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 f"""
-                SELECT id, node_type, content, embedding::text,
-                       utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata,
-                       valid_from::text, valid_until::text
+                SELECT {_node_columns()}
                 FROM {self._nodes}
                 WHERE {where}
                 ORDER BY utility_score DESC
-                {limit_clause}
+                LIMIT ${len(params)}
                 """,
                 *params,
             )
         return [_row_to_node(r) for r in rows]
 
+    async def list_tenants(self) -> list[str]:
+        """Every tenant that owns at least one node (untenanted excluded)."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT DISTINCT tenant FROM {self._nodes} "
+                "WHERE tenant IS NOT NULL ORDER BY tenant"
+            )
+        return [r[0] for r in rows]
+
     # --- Counts ---
 
-    async def node_count(self, node_type: str | None = None) -> int:
+    async def node_count(
+        self, node_type: str | None = None, *, tenant: TenantFilter = ALL_TENANTS
+    ) -> int:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if node_type:
+            params.append(node_type)
+            conditions.append(f"node_type = ${len(params)}")
+        tenant_cond = _tenant_condition("tenant", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+        where = " AND ".join(conditions) if conditions else "TRUE"
         async with self._pool.acquire() as conn:
-            if node_type:
-                row = await conn.fetchrow(
-                    f"SELECT count(*) FROM {self._nodes} WHERE node_type = $1",
-                    node_type,
-                )
-            else:
-                row = await conn.fetchrow(f"SELECT count(*) FROM {self._nodes}")
+            row = await conn.fetchrow(
+                f"SELECT count(*) FROM {self._nodes} WHERE {where}", *params
+            )
         return row[0]
 
-    async def edge_count(self, relation_type: str | None = None) -> int:
+    async def edge_count(
+        self,
+        relation_type: str | None = None,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
+    ) -> int:
+        # An edge belongs to its source node's tenant. Edges never join two
+        # tenants (the graph layer refuses that write), so either end would do.
+        conditions: list[str] = []
+        params: list[Any] = []
+        if relation_type:
+            params.append(relation_type)
+            conditions.append(f"e.relation_type = ${len(params)}")
+        tenant_cond = _tenant_condition("n.tenant", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+        where = " AND ".join(conditions) if conditions else "TRUE"
+        join = (
+            f"JOIN {self._nodes} n ON n.id = e.source_id" if tenant_cond else ""
+        )
         async with self._pool.acquire() as conn:
-            if relation_type:
-                row = await conn.fetchrow(
-                    f"SELECT count(*) FROM {self._edges} WHERE relation_type = $1",
-                    relation_type,
-                )
-            else:
-                row = await conn.fetchrow(f"SELECT count(*) FROM {self._edges}")
+            row = await conn.fetchrow(
+                f"SELECT count(*) FROM {self._edges} e {join} WHERE {where}",
+                *params,
+            )
         return row[0]
 
     # --- Delete ---
@@ -426,39 +503,41 @@ class PostgresBackend:
         embedding: list[float],
         node_type: str | None = None,
         limit: int = 10,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
-        vec_str = _format_vector(embedding)
+        params: list[Any] = [_format_vector(embedding)]
+        conditions = ["embedding IS NOT NULL"]
+        if node_type:
+            params.append(node_type)
+            conditions.append(f"node_type = ${len(params)}")
+        tenant_cond = _tenant_condition("tenant", tenant, params)
+        if tenant_cond:
+            conditions.append(tenant_cond)
+        params.append(limit)
+
+        sql = f"""
+            SELECT {_node_columns()},
+                   1 - (embedding <=> $1::vector) AS similarity
+            FROM {self._nodes}
+            WHERE {" AND ".join(conditions)}
+            ORDER BY embedding <=> $1::vector
+            LIMIT ${len(params)}
+        """
         async with self._pool.acquire() as conn:
-            if node_type:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT id, node_type, content, embedding::text,
-                           utility_score, access_count,
-                           created_at::text, last_accessed::text, metadata,
-                           valid_from::text, valid_until::text,
-                           1 - (embedding <=> $1::vector) AS similarity
-                    FROM {self._nodes}
-                    WHERE node_type = $2 AND embedding IS NOT NULL
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $3
-                    """,
-                    vec_str, node_type, limit,
-                )
+            if tenant_cond and self._iterative_scan:
+                # The hnsw index returns its ef_search nearest candidates
+                # (default 40) and the WHERE filters those afterwards. For a
+                # tenant that owns a small share of the table, most or all
+                # candidates belong to someone else and the search comes back
+                # short or empty, though matching rows exist. Iterative scans
+                # (pgvector 0.8.0+) keep pulling candidates until the LIMIT is
+                # met. Isolation holds either way; this is about recall.
+                async with conn.transaction():
+                    await conn.execute("SET LOCAL hnsw.iterative_scan = strict_order")
+                    rows = await conn.fetch(sql, *params)
             else:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT id, node_type, content, embedding::text,
-                           utility_score, access_count,
-                           created_at::text, last_accessed::text, metadata,
-                           valid_from::text, valid_until::text,
-                           1 - (embedding <=> $1::vector) AS similarity
-                    FROM {self._nodes}
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $2
-                    """,
-                    vec_str, limit,
-                )
+                rows = await conn.fetch(sql, *params)
         return [_row_to_node(r) for r in rows]
 
     # --- Graph traversal via recursive CTE ---
@@ -469,13 +548,21 @@ class PostgresBackend:
         edge_types: list[str] | None = None,
         max_depth: int = 2,
         max_nodes: int = 50,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
         type_filter = ""
         params: list[Any] = [start_id, max_depth, max_nodes]
 
         if edge_types:
-            type_filter = "AND e.relation_type = ANY($4)"
             params.append(edge_types)
+            type_filter = f"AND e.relation_type = ANY(${len(params)})"
+
+        # Filtering the reached nodes is enough for isolation: edges never
+        # join two tenants (the graph layer refuses that write), so a walk
+        # from a node in one tenant cannot pass through another's.
+        tenant_cond = _tenant_condition("n.tenant", tenant, params)
+        node_filter = f"WHERE {tenant_cond}" if tenant_cond else ""
 
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
@@ -509,13 +596,10 @@ class PostgresBackend:
                                  ELSE e.source_id END <> $1
                         {type_filter}
                 )
-                SELECT DISTINCT ON (n.id)
-                    n.id, n.node_type, n.content, n.embedding::text,
-                    n.utility_score, n.access_count,
-                    n.created_at::text, n.last_accessed::text, n.metadata,
-                    n.valid_from::text, n.valid_until::text
+                SELECT DISTINCT ON (n.id) {_node_columns("n")}
                 FROM traversal t
                 JOIN {self._nodes} n ON n.id = t.node_id
+                {node_filter}
                 LIMIT $3
                 """,
                 *params,
@@ -527,6 +611,17 @@ class PostgresBackend:
 
 
 # --- Helpers ---
+
+
+def _version_at_least(version: str | None, minimum: tuple[int, ...]) -> bool:
+    """Compare a dotted extension version ("0.8.0") against ``minimum``."""
+    if not version:
+        return False
+    parts: list[int] = []
+    for piece in version.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts) >= minimum
 
 
 def _format_vector(embedding: list[float]) -> str:
@@ -558,6 +653,7 @@ def _row_to_node(row: asyncpg.Record) -> dict[str, Any]:
         "metadata": meta if isinstance(meta, dict) else {},
         "valid_from": row["valid_from"] if "valid_from" in row.keys() else None,
         "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+        "tenant": row["tenant"] if "tenant" in row.keys() else None,
     }
 
 

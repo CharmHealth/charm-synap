@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tenant isolation.** `CognitiveMemory.scoped(tenant)` returns a memory restricted to one tenant: every subsystem read and write, the domain, and consolidation stay inside it. The tenant filter runs inside each backend query (Postgres, Kuzu, SQLite, in-memory), so limits and similarity ranking are computed over that tenant's nodes only. Also `CognitiveMemory.tenants()`, `CognitiveMemory.consolidate_tenants()` (one consolidation pass per tenant), `GraphStore.scoped()` / `tenant` / `tenants()`, `MemoryNode.tenant`, and the `synap.tenancy` module (`ALL_TENANTS`, `TenantMismatchError`). See "Tenancy" in `docs/api.md`.
+- `CognitiveMemory(domain_factory=...)` builds the domain for each scoped instance; required to scope a domain that is not a plain `SemanticMemory`.
+- Postgres: scoped similarity searches use `hnsw.iterative_scan` on pgvector 0.8.0+, so a tenant owning a small share of the table still gets full results.
+
+### Changed
+
+- **Breaking (custom backends):** `StorageBackend` / `AsyncStorageBackend` read methods (`query_nodes`, `similarity_search`, `traverse`, `node_count`, `edge_count`) take a keyword-only `tenant` argument, and backends must implement `list_tenants()`. `PersistentGraph` always passes `tenant`, so a backend without it raises `TypeError`. The bundled backends add a `tenant` column on open (idempotent forward migration); existing rows become untenanted.
+- **Breaking:** a graph now reads and writes one namespace. An unscoped graph (and the `CognitiveMemory` built on it) sees only untenanted nodes, which is every node in a store written before this release, so single-tenant users see no difference.
+- A write whose node id already exists under another tenant raises `TenantMismatchError` instead of overwriting it, on every backend.
+- Consolidated fact ids include the tenant, so the same pattern in two tenants produces two facts. Untenanted ids are unchanged.
+- `CognitiveMemory.consolidate_tenants()`: one tenant's consolidation raising no longer aborts the rest. The failure is logged (tenant id included) and recorded as a failed `ConsolidationResult` under that tenant's key, so the other tenants' results aren't lost and the caller can see what failed.
+
+### Fixed
+
+- `write_batch` (`MemoryGraph` and `PersistentGraph`) no longer stamps the caller's `MemoryNode.tenant` when the write doesn't go through (e.g. an edge referencing a node outside the batch and outside the tenant) — the node is left exactly as passed in, so a retry isn't working from a half-written object.
+
 ## [0.2.0] - 2026-09-17
 
 ### Changed

@@ -16,6 +16,7 @@ from synap.protocols import (
     StorageBackend,
 )
 from synap.semantic import SemanticMemory, SemanticResult
+from synap.tenancy import ALL_TENANTS, TenantMismatchError
 from synap.types import (
     CapacityHints,
     ConsolidationEvent,
@@ -32,6 +33,7 @@ from synap.types import (
 )
 
 __all__ = [
+    "ALL_TENANTS",
     "AsyncStorageBackend",
     "Bootstrap",
     "CapacityHints",
@@ -63,5 +65,6 @@ __all__ = [
     "SemanticMemory",
     "SemanticResult",
     "StorageBackend",
+    "TenantMismatchError",
     "ToolCall",
 ]

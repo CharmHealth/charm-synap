@@ -130,6 +130,44 @@ memory.episodic     # EpisodicMemory
 memory.graph        # GraphStore (MemoryGraph or PersistentGraph)
 ```
 
+### Tenancy
+
+For a store shared by several tenants (organizations, accounts) that must never
+read each other's memory. A tenant is an opaque string; synap only compares it.
+
+```python
+root = CognitiveMemory(domain=..., graph=graph, ...)   # untenanted namespace
+acme = root.scoped("acme")                             # cached per tenant
+
+await acme.record_outcome(...)   # stamped tenant="acme"
+await acme.prepare_call(...)     # sees only acme's procedures, episodes, facts
+
+await root.tenants()               # ["acme", ...]
+await root.consolidate_tenants()   # {"acme": [...], ...}, one pass per tenant
+```
+
+`consolidate_tenants()` runs every tenant's pass even if one raises: that
+tenant's entry in the returned dict is a single failed `ConsolidationResult`
+(`success=False`, `error` set) and the failure is logged, but every other
+tenant's real results are still returned.
+
+- Every read is filtered to the tenant inside the backend query, before the
+  `LIMIT` and similarity ranking, so a scoped search ranks only that tenant's
+  nodes.
+- The root instance is a namespace of its own (nodes with `tenant=None`). It
+  sees no tenant's nodes, and no scoped instance sees its nodes.
+- A write that would overwrite a node owned by another tenant raises
+  `TenantMismatchError`. An edge between two tenants' nodes raises `KeyError`
+  (the far node reads as absent).
+- `scoped()` builds a `SemanticMemory` domain on the scoped graph. For any
+  other domain, pass `domain_factory=lambda graph: MyDomain(...)` to the
+  constructor; `scoped()` raises `ValueError` without one rather than reuse the
+  root domain.
+- Postgres: with pgvector 0.8.0+, scoped similarity searches enable
+  `hnsw.iterative_scan` so a small tenant still gets full results from the
+  HNSW index. On older pgvector, isolation holds but a small tenant's results
+  can come back short.
+
 ---
 
 ## SemanticDomain Protocol
