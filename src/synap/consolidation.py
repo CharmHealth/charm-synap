@@ -24,7 +24,9 @@ if TYPE_CHECKING:
     from synap.procedural import ProceduralMemory
 
 
-def _consolidated_fact_id(metadata: dict[str, Any]) -> str | None:
+def _consolidated_fact_id(
+    metadata: dict[str, Any], tenant: str | None = None
+) -> str | None:
     """Deterministic id for a consolidated fact, so re-consolidating the same
     pattern upserts one fact instead of spraying random-UUID duplicates.
 
@@ -32,6 +34,11 @@ def _consolidated_fact_id(metadata: dict[str, Any]) -> str | None:
     episodes the pattern spans. Retrieval-triggered consolidations have no
     pattern; they key on the query string instead. Anything without either keeps
     a random id (no dedup).
+
+    The tenant is part of the identity. Two tenants that see the same pattern
+    must get two facts: with one shared id, the second tenant's consolidation
+    would target the first tenant's node (refused by the graph as a tenant
+    mismatch). Untenanted ids are unchanged from before tenancy existed.
     """
     task_type = metadata.get("task_type")
     pattern_key = metadata.get("pattern_key")
@@ -41,6 +48,8 @@ def _consolidated_fact_id(metadata: dict[str, Any]) -> str | None:
         basis = f"query\x00{metadata['query']}"
     else:
         return None
+    if tenant is not None:
+        basis = f"tenant\x00{tenant}\x00{basis}"
     return "consolidated:" + hashlib.sha256(basis.encode()).hexdigest()[:24]
 
 
@@ -281,7 +290,9 @@ class ConsolidationEngine:
             insights=[fact.strip()],
             source_episodes=event.candidates,
             metadata=event.metadata,
-            node_id=_consolidated_fact_id(event.metadata),
+            node_id=_consolidated_fact_id(
+                event.metadata, getattr(self._graph, "tenant", None)
+            ),
         )
 
         for candidate in event.candidates:

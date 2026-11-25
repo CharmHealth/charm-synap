@@ -10,6 +10,33 @@ from pathlib import Path
 from typing import Any
 
 from synap._utils import cosine_similarity
+from synap.tenancy import (
+    ALL_TENANTS,
+    TenantFilter,
+    TenantMismatchError,
+    tenant_matches,
+)
+
+
+def _tenant_condition(tenant: TenantFilter, params: list[Any]) -> str | None:
+    """SQL predicate for a tenant filter, appending any bind to ``params``."""
+    if tenant is ALL_TENANTS:
+        return None
+    if tenant is None:
+        return "tenant IS NULL"
+    params.append(tenant)
+    return "tenant = ?"
+
+
+def _with_tenant(row: sqlite3.Row) -> dict[str, Any]:
+    """Node dict from a row, with tenant taken from its column.
+
+    The column is authoritative: rows written before it existed have no
+    tenant in their ``data`` blob.
+    """
+    data = json.loads(row["data"])
+    data["tenant"] = row["tenant"]
+    return data
 
 
 def _synchronized(method):
@@ -86,6 +113,15 @@ class SQLiteBackend:
             CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(relation_type);
         """)
+        # Forward-migrate a store created before the tenant column existed
+        # (see synap.tenancy). SQLite has no ADD COLUMN IF NOT EXISTS.
+        try:
+            self._conn.execute("ALTER TABLE nodes ADD COLUMN tenant TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already present
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_tenant_type ON nodes(tenant, node_type)"
+        )
         self._conn.commit()
 
     def _write_node_row(self, node: dict[str, Any]) -> None:
@@ -95,11 +131,22 @@ class SQLiteBackend:
             if node.get("embedding") is not None
             else None
         )
+        tenant = node.get("tenant")
+        # INSERT OR REPLACE keys on id alone; an id that exists under another
+        # tenant would be overwritten and moved. Refuse it instead.
+        existing = self._conn.execute(
+            "SELECT tenant FROM nodes WHERE id = ?", (node["id"],)
+        ).fetchone()
+        if existing is not None and existing["tenant"] != tenant:
+            raise TenantMismatchError(
+                f"node {node['id']!r} belongs to a different tenant; "
+                "refusing to overwrite it"
+            )
         self._conn.execute(
             """INSERT OR REPLACE INTO nodes
                (id, node_type, content, embedding, utility_score,
-                access_count, created_at, last_accessed, metadata, data)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                access_count, created_at, last_accessed, metadata, data, tenant)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 node["id"],
                 node["node_type"],
@@ -111,6 +158,7 @@ class SQLiteBackend:
                 node["last_accessed"],
                 json.dumps(node.get("metadata", {})),
                 json.dumps(node),
+                tenant,
             ),
         )
 
@@ -161,11 +209,11 @@ class SQLiteBackend:
     @_synchronized
     def load_node(self, node_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
-            "SELECT data FROM nodes WHERE id = ?", (node_id,)
+            "SELECT data, tenant FROM nodes WHERE id = ?", (node_id,)
         ).fetchone()
         if row is None:
             return None
-        return json.loads(row["data"])
+        return _with_tenant(row)
 
     @_synchronized
     def load_edges(
@@ -190,13 +238,19 @@ class SQLiteBackend:
         node_type: str | None = None,
         filters: dict[str, Any] | None = None,
         limit: int = 100,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
-        query = "SELECT data, metadata FROM nodes WHERE 1=1"
+        query = "SELECT data, metadata, tenant FROM nodes WHERE 1=1"
         params: list[Any] = []
 
         if node_type:
             query += " AND node_type = ?"
             params.append(node_type)
+
+        tenant_cond = _tenant_condition(tenant, params)
+        if tenant_cond:
+            query += f" AND {tenant_cond}"
 
         query += " ORDER BY utility_score DESC"
 
@@ -211,7 +265,7 @@ class SQLiteBackend:
         rows = self._conn.execute(query, params).fetchall()
         results = []
         for row in rows:
-            data = json.loads(row["data"])
+            data = _with_tenant(row)
             if filters:
                 meta = json.loads(row["metadata"])
                 if all(meta.get(k) == v for k, v in filters.items()):
@@ -223,25 +277,49 @@ class SQLiteBackend:
         return results
 
     @_synchronized
-    def node_count(self, node_type: str | None = None) -> int:
-        if node_type:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM nodes WHERE node_type = ?", (node_type,)
-            ).fetchone()
-        else:
-            row = self._conn.execute("SELECT COUNT(*) FROM nodes").fetchone()
-        return row[0]
+    def list_tenants(self) -> list[str]:
+        """Every tenant that owns at least one node (untenanted excluded)."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT tenant FROM nodes WHERE tenant IS NOT NULL ORDER BY tenant"
+        ).fetchall()
+        return [r[0] for r in rows]
 
     @_synchronized
-    def edge_count(self, relation_type: str | None = None) -> int:
+    def node_count(
+        self, node_type: str | None = None, *, tenant: TenantFilter = ALL_TENANTS
+    ) -> int:
+        query = "SELECT COUNT(*) FROM nodes WHERE 1=1"
+        params: list[Any] = []
+        if node_type:
+            query += " AND node_type = ?"
+            params.append(node_type)
+        tenant_cond = _tenant_condition(tenant, params)
+        if tenant_cond:
+            query += f" AND {tenant_cond}"
+        return self._conn.execute(query, params).fetchone()[0]
+
+    @_synchronized
+    def edge_count(
+        self,
+        relation_type: str | None = None,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
+    ) -> int:
+        # An edge belongs to its source node's tenant; edges never join two
+        # tenants (the graph layer refuses that write).
+        query = "SELECT COUNT(*) FROM edges e"
+        params: list[Any] = []
+        conditions: list[str] = []
+        tenant_cond = _tenant_condition(tenant, params)
+        if tenant_cond:
+            query += " JOIN nodes n ON n.id = e.source_id"
+            conditions.append(tenant_cond.replace("tenant", "n.tenant", 1))
         if relation_type:
-            row = self._conn.execute(
-                "SELECT COUNT(*) FROM edges WHERE relation_type = ?",
-                (relation_type,),
-            ).fetchone()
-        else:
-            row = self._conn.execute("SELECT COUNT(*) FROM edges").fetchone()
-        return row[0]
+            conditions.append("e.relation_type = ?")
+            params.append(relation_type)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        return self._conn.execute(query, params).fetchone()[0]
 
     def _delete_node_rows(self, node_id: str) -> None:
         """Delete a node and its edges without committing (for batching)."""
@@ -278,13 +356,18 @@ class SQLiteBackend:
         embedding: list[float],
         node_type: str | None = None,
         limit: int = 10,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
         """Brute-force cosine similarity search."""
-        query = "SELECT data, embedding FROM nodes WHERE embedding IS NOT NULL"
+        query = "SELECT data, embedding, tenant FROM nodes WHERE embedding IS NOT NULL"
         params: list[Any] = []
         if node_type:
             query += " AND node_type = ?"
             params.append(node_type)
+        tenant_cond = _tenant_condition(tenant, params)
+        if tenant_cond:
+            query += f" AND {tenant_cond}"
 
         rows = self._conn.execute(query, params).fetchall()
         scored: list[tuple[float, dict[str, Any]]] = []
@@ -299,7 +382,7 @@ class SQLiteBackend:
                     f"the store holds inconsistent embedding dimensions"
                 )
             sim = cosine_similarity(embedding, node_embedding)
-            scored.append((sim, json.loads(row["data"])))
+            scored.append((sim, _with_tenant(row)))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         return [data for _, data in scored[:limit]]
@@ -311,8 +394,13 @@ class SQLiteBackend:
         edge_types: list[str] | None = None,
         max_depth: int = 2,
         max_nodes: int = 50,
+        *,
+        tenant: TenantFilter = ALL_TENANTS,
     ) -> list[dict[str, Any]]:
-        """BFS traversal from start node. Not graph-native — walks edges in Python."""
+        """BFS traversal from start node. Not graph-native — walks edges in Python.
+
+        A node outside ``tenant`` is neither returned nor walked through.
+        """
         visited: set[str] = {start_id}
         frontier = [start_id]
         results: list[dict[str, Any]] = []
@@ -330,7 +418,7 @@ class SQLiteBackend:
                     if neighbor_id not in visited:
                         visited.add(neighbor_id)
                         node = self.load_node(neighbor_id)
-                        if node:
+                        if node and tenant_matches(node.get("tenant"), tenant):
                             results.append(node)
                             if len(results) >= max_nodes:
                                 return results

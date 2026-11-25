@@ -457,6 +457,97 @@ async def test_the_planner_uses_that_index_for_the_search_query(db: PostgresBack
     assert "embedding <=>" in plan, plan
     assert "Seq Scan" not in plan, plan
 
+class _HeldConnection:
+    """An async-context-manager ``acquire()`` over one already-open connection.
+
+    A real pool resets session state (GUCs like ``hnsw.ef_search``) between
+    ``acquire``/``release``, which would silently undo the settings this test
+    depends on between the backend's internal calls. The backend only ever
+    does ``async with self._pool.acquire() as conn: ...`` and ``await
+    self._pool.close()``, so this covers everything it needs without pulling
+    in a real pool.
+    """
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self._conn = conn
+
+    def acquire(self) -> _HeldConnection:
+        return self
+
+    async def __aenter__(self) -> asyncpg.Connection:
+        return self._conn
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+    async def close(self) -> None:
+        await self._conn.close()
+
+
+async def test_iterative_scan_finds_a_small_tenants_result_under_the_hnsw_index(
+    request,
+):
+    """Proves the recall fix, not just that isolation holds.
+
+    A plain (non-iterative) HNSW scan returns at most ``hnsw.ef_search``
+    candidates and filters afterwards; it does not keep searching if none of
+    them pass the filter. With ``ef_search`` turned down and a big tenant's
+    nodes filling that whole candidate budget, a small tenant's one far node
+    never gets considered — confirmed directly against raw SQL before writing
+    this test (``EXPLAIN ANALYZE`` on the equivalent query returns 0 rows at
+    ``ef_search=1`` without iterative scan). ``_iterative_scan`` (``SET LOCAL
+    hnsw.iterative_scan = strict_order``) exists to fix exactly that.
+
+    Two things a smaller/cheaper test would miss:
+    - ``enable_seqscan = off`` alone is not enough: this table also has a
+      ``(tenant, node_type)`` index, and for a small, selective tenant the
+      planner prefers *that* over the hnsw index, sorts the few matching rows
+      exactly, and never exercises the ANN path at all. Dropped here so hnsw
+      is the only option, matching a deployment where it isn't (a large
+      tenant sharing the table, or stale planner stats).
+    - A pool resets session GUCs between acquires, which would silently
+      revert ``ef_search``/``enable_seqscan`` before the search ever runs; a
+      single held connection (``_HeldConnection``) avoids that.
+    """
+    prefix = _prefix(request)
+    conn = await asyncpg.connect(DSN)
+    pool = _HeldConnection(conn)
+    backend = PostgresBackend(pool, embedding_dim=3, table_prefix=prefix)
+    await backend.init()
+    try:
+        if not backend._iterative_scan:
+            pytest.skip("requires pgvector 0.8.0+ for hnsw.iterative_scan")
+
+        await conn.execute(f"DROP INDEX IF EXISTS idx_{prefix}nodes_tenant_type")
+        await conn.execute("SET enable_seqscan = off")
+        await conn.execute("SET hnsw.ef_search = 1")
+
+        query = [1.0, 0.0, 0.0]
+        # Big tenant: fills the (tiny) ef_search candidate budget on its own.
+        for i in range(10):
+            node = _make_node(f"big{i}", embedding=[1.0, 0.0005 * i, 0.0])
+            node["tenant"] = "big"
+            await backend.save_node(node)
+        # Small tenant: one node far from the query -- never an ANN candidate
+        # at this ef_search, but the only node under this tenant.
+        small = _make_node("small0", embedding=[0.0, 0.0, 1.0])
+        small["tenant"] = "small"
+        await backend.save_node(small)
+
+        # Proves this test would actually catch the bug it targets: without
+        # iterative scan, the small tenant's result does not come back.
+        backend._iterative_scan = False
+        assert await backend.similarity_search(query, limit=1, tenant="small") == []
+
+        backend._iterative_scan = True
+        results = await backend.similarity_search(query, limit=1, tenant="small")
+        assert [r["id"] for r in results] == ["small0"]
+    finally:
+        await conn.execute(f"DROP TABLE IF EXISTS {prefix}edges CASCADE")
+        await conn.execute(f"DROP TABLE IF EXISTS {prefix}nodes CASCADE")
+        await pool.close()
+
+
 async def test_a_dimension_over_the_hnsw_limit_is_refused_at_construction(db: PostgresBackend):
     """The ceiling is new, so it needs to fail where a reader can see why.
 

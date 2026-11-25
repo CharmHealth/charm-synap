@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,8 +25,12 @@ from synap.protocols import (
     SemanticDomain,
     StorageBackend,
 )
+from synap.semantic import SemanticMemory
+from synap.tenancy import validate_tenant
 from synap.types import (
     CapacityHints,
+    ConsolidationEvent,
+    ConsolidationTrigger,
     DomainResult,
     Episode,
     EpisodeOutcome,
@@ -32,6 +38,8 @@ from synap.types import (
     PreparedContext,
     ToolCall,
 )
+
+logger = logging.getLogger(__name__)
 
 _EXTRACT_PROMPT = """\
 Analyze this conversation and extract:
@@ -78,6 +86,13 @@ class CognitiveMemory:
     Consumers use this to store experiences, retrieve context, and
     get output schemas for LLM calls. The library prepares context
     and records outcomes; the consumer owns the agent loop and LLM client.
+
+    Tenancy: an instance works in one namespace, the one its graph is bound
+    to (see ``synap.tenancy``). The instance you construct is the untenanted
+    namespace. ``scoped(tenant)`` returns an instance whose every subsystem,
+    domain and consolidation pass sees only that tenant's memory. A
+    multi-tenant consumer holds the root only to hand out scoped instances
+    and to run per-tenant maintenance (``consolidate_tenants``).
     """
 
     def __init__(
@@ -90,9 +105,17 @@ class CognitiveMemory:
         consolidation_config: ConsolidationConfig | None = None,
         utility_decay_rate: float = 0.01,
         backend: StorageBackend | None = None,
+        domain_factory: Callable[[GraphStore], SemanticDomain] | None = None,
     ) -> None:
         self._capacity = capacity or CapacityHints()
         self._llm = llm_provider
+        self._embedder = embedding_provider
+        self._consolidation_config = consolidation_config
+        # Builds the domain for a scoped instance, bound to its scoped graph.
+        # Needed whenever the domain is not a plain SemanticMemory, because
+        # synap cannot know how to rebuild a consumer's domain on another graph.
+        self._domain_factory = domain_factory
+        self._scoped: dict[str, CognitiveMemory] = {}
 
         if graph is not None:
             self._graph = graph
@@ -417,6 +440,108 @@ class CognitiveMemory:
     @property
     def graph(self) -> GraphStore:
         return self._graph
+
+    # --- Tenancy ---
+
+    @property
+    def tenant(self) -> str | None:
+        """The namespace this instance works in; None is untenanted."""
+        return getattr(self._graph, "tenant", None)
+
+    def scoped(self, tenant: str) -> CognitiveMemory:
+        """This memory, restricted to ``tenant``.
+
+        Every read and write through the returned instance, including
+        consolidation, stays inside ``tenant``. Instances are cached per
+        tenant, so event-driven consolidation queued by one call is still
+        there for the next ``consolidate()``.
+        """
+        tenant = validate_tenant(tenant)
+        if self.tenant is not None:
+            raise ValueError(
+                f"this memory is already scoped to tenant {self.tenant!r}; "
+                "scope from the unscoped instance instead"
+            )
+        cached = self._scoped.get(tenant)
+        if cached is not None:
+            return cached
+
+        scope = getattr(self._graph, "scoped", None)
+        if scope is None:
+            raise TypeError(
+                f"{type(self._graph).__name__} does not support tenant scoping"
+            )
+        graph: GraphStore = scope(tenant)
+
+        if self._domain_factory is not None:
+            domain = self._domain_factory(graph)
+        elif type(self._domain) is SemanticMemory:
+            domain = SemanticMemory(
+                graph=graph,
+                embedding_provider=self._embedder,
+                llm_provider=self._llm,
+            )
+        else:
+            # Reusing the root domain would read and write the untenanted
+            # namespace from inside a scoped instance. Refuse rather than leak.
+            raise ValueError(
+                f"cannot scope a {type(self._domain).__name__} domain; pass "
+                "domain_factory to CognitiveMemory to build it on a scoped graph"
+            )
+
+        child = CognitiveMemory(
+            domain=domain,
+            embedding_provider=self._embedder,
+            llm_provider=self._llm,
+            graph=graph,
+            capacity=self._capacity,
+            consolidation_config=self._consolidation_config,
+        )
+        self._scoped[tenant] = child
+        return child
+
+    async def tenants(self) -> list[str]:
+        """Every tenant that owns memory in the underlying store."""
+        list_tenants = getattr(self._graph, "tenants", None)
+        if list_tenants is None:
+            return []
+        return await list_tenants()
+
+    async def consolidate_tenants(self) -> dict[str, list[ConsolidationResult]]:
+        """Run ``consolidate()`` separately for every tenant in the store.
+
+        Each pass sees one tenant's episodes only, so a pattern can never be
+        built from two tenants' experiences. The untenanted namespace is not
+        included; call ``consolidate()`` on this instance for that.
+
+        One tenant's consolidation raising does not stop the others: the
+        failure is logged (with the tenant id) and recorded as a single
+        failed ``ConsolidationResult`` for that tenant, so a caller who
+        inspects the returned dict sees it instead of losing every other
+        tenant's results to an exception that aborted the whole call.
+        """
+        results: dict[str, list[ConsolidationResult]] = {}
+        for tenant in await self.tenants():
+            try:
+                results[tenant] = await self.scoped(tenant).consolidate()
+            except Exception as exc:
+                logger.error(
+                    "consolidation failed for tenant %r: %s", tenant, exc, exc_info=True
+                )
+                results[tenant] = [
+                    ConsolidationResult(
+                        event=ConsolidationEvent(
+                            source_type=MemoryType.EPISODIC,
+                            target_type=MemoryType.EPISODIC,
+                            candidates=[],
+                            trigger=ConsolidationTrigger.PERIODIC,
+                            metadata={"tenant": tenant, "stage": "consolidate_tenants"},
+                        ),
+                        success=False,
+                        error=str(exc),
+                    )
+                ]
+        return results
 
     # --- Lifecycle ---
 

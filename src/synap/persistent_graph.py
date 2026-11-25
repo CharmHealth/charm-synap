@@ -13,6 +13,7 @@ from synap._utils import (
     select_evictions,
 )
 from synap.protocols import AsyncStorageBackend, StorageBackend
+from synap.tenancy import TenantMismatchError, validate_tenant
 from synap.types import MemoryEdge, MemoryNode, MemoryType
 
 # Re-exported for callers that import it from here; canonical home is synap._utils.
@@ -36,6 +37,7 @@ def _node_to_dict(node: MemoryNode) -> dict[str, Any]:
         "metadata": node.metadata,
         "valid_from": node.valid_from.isoformat() if node.valid_from else None,
         "valid_until": node.valid_until.isoformat() if node.valid_until else None,
+        "tenant": node.tenant,
     }
 
 
@@ -52,6 +54,7 @@ def _dict_to_node(d: dict[str, Any]) -> MemoryNode:
         metadata=_as_dict(d.get("metadata")),
         valid_from=_parse_dt_optional(d.get("valid_from")),
         valid_until=_parse_dt_optional(d.get("valid_until")),
+        tenant=d.get("tenant"),
     )
 
 
@@ -102,15 +105,26 @@ class PersistentGraph:
 
     Sync backends (Kuzu, SQLite) are dispatched via asyncio.to_thread.
     Async backends (Postgres) are called directly.
+
+    A graph is bound to one tenant namespace (see ``synap.tenancy``). The
+    graph you construct is the untenanted namespace (``tenant`` is None);
+    ``scoped(tenant)`` returns a graph over the same backend bound to that
+    tenant. Every read is filtered to the bound namespace inside the backend
+    query, so limits and similarity rankings are computed over that tenant's
+    nodes only. Every write is stamped with it, and a write that would touch a
+    node, or join an edge to a node, outside it raises.
     """
 
     def __init__(
         self,
         backend: StorageBackend | AsyncStorageBackend,
         utility_decay_rate: float = 0.01,
+        *,
+        tenant: str | None = None,
     ) -> None:
         self._backend = backend
         self._utility_decay_rate = utility_decay_rate
+        self._tenant = validate_tenant(tenant) if tenant is not None else None
         self._async = inspect.iscoroutinefunction(
             getattr(backend, "save_node", None)
         )
@@ -125,10 +139,63 @@ class PersistentGraph:
     def backend(self) -> StorageBackend | AsyncStorageBackend:
         return self._backend
 
+    # --- Tenancy ---
+
+    @property
+    def tenant(self) -> str | None:
+        """The namespace this graph reads and writes; None is untenanted."""
+        return self._tenant
+
+    def scoped(self, tenant: str) -> PersistentGraph:
+        """A graph over the same backend, bound to ``tenant``.
+
+        Only an unscoped graph can be scoped: re-scoping a scoped graph would
+        let code holding tenant A's handle reach tenant B's.
+        """
+        if self._tenant is not None:
+            raise ValueError(
+                f"graph is already scoped to tenant {self._tenant!r}; "
+                "scope from the unscoped graph instead"
+            )
+        return PersistentGraph(
+            self._backend,
+            utility_decay_rate=self._utility_decay_rate,
+            tenant=validate_tenant(tenant),
+        )
+
+    async def tenants(self) -> list[str]:
+        """Every tenant that owns at least one node in the backend."""
+        return await self._call(self._backend.list_tenants)
+
+    def _visible(self, d: dict[str, Any] | None) -> bool:
+        return d is not None and d.get("tenant") == self._tenant
+
+    def _stamp(self, node: MemoryNode) -> dict[str, Any]:
+        """Serialize ``node`` for a write in this graph's namespace.
+
+        Does not mutate ``node``: the caller's object must not look written
+        until the backend call it is serialized for has actually succeeded.
+        ``add_node``/``write_batch`` set ``node.tenant`` themselves, only
+        after that call returns.
+        """
+        if node.tenant is not None and node.tenant != self._tenant:
+            raise TenantMismatchError(
+                f"node {node.id!r} is tenant {node.tenant!r}; this graph is "
+                f"tenant {self._tenant!r}"
+            )
+        d = _node_to_dict(node)
+        d["tenant"] = self._tenant
+        return d
+
+    async def _load_visible(self, node_id: str) -> dict[str, Any] | None:
+        d = await self._call(self._backend.load_node, node_id)
+        return d if self._visible(d) else None
+
     # --- Node operations ---
 
     async def add_node(self, node: MemoryNode) -> str:
-        await self._call(self._backend.save_node, _node_to_dict(node))
+        await self._call(self._backend.save_node, self._stamp(node))
+        node.tenant = self._tenant
         return node.id
 
     async def write_batch(
@@ -139,7 +206,12 @@ class PersistentGraph:
         Falls back to sequential (non-atomic) writes for backends without
         write_batch — the in-memory graph and any future minimal backend.
         """
-        node_dicts = [_node_to_dict(n) for n in nodes]
+        node_dicts = [self._stamp(n) for n in nodes]
+        batch_ids = {n.id for n in nodes}
+        for edge in edges:
+            for end in (edge.source_id, edge.target_id):
+                if end not in batch_ids and await self._load_visible(end) is None:
+                    raise KeyError(f"Node {end} not in graph")
         edge_dicts = [_edge_to_dict(e) for e in edges]
         if hasattr(self._backend, "write_batch"):
             await self._call(self._backend.write_batch, node_dicts, edge_dicts)
@@ -148,39 +220,51 @@ class PersistentGraph:
                 await self._call(self._backend.save_node, d)
             for d in edge_dicts:
                 await self._call(self._backend.save_edge, d)
+        # Only now that the write (or, for a backend without write_batch, every
+        # individual save) has gone through does the caller's node reflect it.
+        for n in nodes:
+            n.tenant = self._tenant
 
     async def get_node(self, node_id: str) -> MemoryNode | None:
-        d = await self._call(self._backend.load_node, node_id)
+        d = await self._load_visible(node_id)
         if d is None:
             return None
         return _dict_to_node(d)
 
     async def remove_node(self, node_id: str) -> None:
+        if await self._load_visible(node_id) is None:
+            return
         await self._call(self._backend.delete_node, node_id)
 
     async def node_count(self, node_type: MemoryType | None = None) -> int:
         return await self._call(
             self._backend.node_count,
             node_type.value if node_type else None,
+            tenant=self._tenant,
         )
 
     # --- Edge operations ---
 
     async def add_edge(self, edge: MemoryEdge) -> str:
-        src = await self._call(self._backend.load_node, edge.source_id)
-        if src is None:
+        # A node in another namespace reads as absent, so an edge can never
+        # join two tenants. Traversal relies on that.
+        if await self._load_visible(edge.source_id) is None:
             raise KeyError(f"Source node {edge.source_id} not in graph")
-        tgt = await self._call(self._backend.load_node, edge.target_id)
-        if tgt is None:
+        if await self._load_visible(edge.target_id) is None:
             raise KeyError(f"Target node {edge.target_id} not in graph")
         await self._call(self._backend.save_edge, _edge_to_dict(edge))
         return edge.id
 
     async def remove_edge(self, edge_id: str) -> None:
+        # Backends have no load-edge-by-id, so this cannot check the edge's
+        # tenant. It returns nothing and needs an edge id, which only a read
+        # inside the owning tenant hands out.
         await self._call(self._backend.delete_edge, edge_id)
 
     async def edge_count(self, relation_type: str | None = None) -> int:
-        return await self._call(self._backend.edge_count, relation_type)
+        return await self._call(
+            self._backend.edge_count, relation_type, tenant=self._tenant
+        )
 
     # --- Traversal ---
 
@@ -190,6 +274,8 @@ class PersistentGraph:
         edge_type: str | None = None,
         direction: str = "outgoing",
     ) -> list[MemoryNode]:
+        if await self._load_visible(node_id) is None:
+            return []
         edges = await self._call(self._backend.load_edges, node_id, edge_type)
         results = []
         for e in edges:
@@ -200,7 +286,7 @@ class PersistentGraph:
             neighbor_id = (
                 e["target_id"] if e["source_id"] == node_id else e["source_id"]
             )
-            d = await self._call(self._backend.load_node, neighbor_id)
+            d = await self._load_visible(neighbor_id)
             if d:
                 results.append(_dict_to_node(d))
         return results
@@ -212,8 +298,15 @@ class PersistentGraph:
         max_depth: int = 2,
         max_nodes: int = 50,
     ) -> list[MemoryNode]:
+        if await self._load_visible(start) is None:
+            return []
         results = await self._call(
-            self._backend.traverse, start, edge_types, max_depth, max_nodes,
+            self._backend.traverse,
+            start,
+            edge_types,
+            max_depth,
+            max_nodes,
+            tenant=self._tenant,
         )
         return [_dict_to_node(d) for d in results]
 
@@ -230,13 +323,14 @@ class PersistentGraph:
             node_type.value if node_type else None,
             filters,
             limit,
+            tenant=self._tenant,
         )
         return [_dict_to_node(d) for d in results]
 
     # --- Utility & lifecycle ---
 
     async def update_utility(self, node_id: str) -> None:
-        d = await self._call(self._backend.load_node, node_id)
+        d = await self._load_visible(node_id)
         if d is None:
             return
         node = _dict_to_node(d)
@@ -258,13 +352,14 @@ class PersistentGraph:
                 self._backend.decay_all_scores,
                 self._utility_decay_rate,
                 now_ms,
+                tenant=self._tenant,
             )
             return
 
         # Fallback for backends without server-side decay
         now = datetime.now(UTC)
         all_nodes = await self._call(
-            self._backend.query_nodes, None, None, 100_000
+            self._backend.query_nodes, None, None, 100_000, tenant=self._tenant
         )
         updated = []
         for d in all_nodes:
@@ -286,7 +381,7 @@ class PersistentGraph:
         # This can't stay server-side — Kuzu stores metadata as a JSON string, so
         # grouping episodic nodes by episode_id happens here, not in the query.
         all_nodes = await self._call(
-            self._backend.query_nodes, None, None, 100_000
+            self._backend.query_nodes, None, None, 100_000, tenant=self._tenant
         )
         items = [
             (
@@ -314,6 +409,8 @@ class PersistentGraph:
         target_id: str,
         relation_type: str | None = None,
     ) -> list[MemoryEdge]:
+        if await self._load_visible(source_id) is None:
+            return []
         edges = await self._call(self._backend.load_edges, source_id)
         results = []
         for e in edges:
@@ -325,6 +422,8 @@ class PersistentGraph:
         return results
 
     async def has_incoming_edge(self, node_id: str, relation_type: str) -> bool:
+        if await self._load_visible(node_id) is None:
+            return False
         edges = await self._call(self._backend.load_edges, node_id)
         for e in edges:
             if e["target_id"] == node_id and e["relation_type"] == relation_type:
@@ -342,6 +441,7 @@ class PersistentGraph:
             embedding,
             node_type.value if node_type else None,
             limit,
+            tenant=self._tenant,
         )
         return [_dict_to_node(d) for d in results]
 
