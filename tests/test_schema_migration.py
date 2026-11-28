@@ -18,11 +18,8 @@ import pytest
 
 from synap.backends.kuzu import KuzuBackend
 from synap.backends.postgres import PostgresBackend
-
-try:
-    import asyncpg
-except ImportError:  # pragma: no cover
-    asyncpg = None
+from tests.pg_pool import AVAILABLE as PG_AVAILABLE
+from tests.pg_pool import open_pool
 
 DSN = os.environ.get("SYNAP_TEST_POSTGRES_DSN")
 
@@ -76,13 +73,13 @@ def test_kuzu_migrates_store_missing_temporal_columns(tmp_path):
 
 
 @pytest.mark.skipif(
-    asyncpg is None or not DSN,
-    reason="set SYNAP_TEST_POSTGRES_DSN (with asyncpg) for Postgres migration test",
+    not PG_AVAILABLE or not DSN,
+    reason="set SYNAP_TEST_POSTGRES_DSN (with psycopg) for Postgres migration test",
 )
 async def test_postgres_migrates_store_missing_temporal_columns():
     prefix = f"mig_{uuid.uuid4().hex[:12]}_"
-    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=5)
-    async with pool.acquire() as conn:
+    pool = await open_pool(DSN)
+    async with pool.connection() as conn:
         await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
         # Pre-branch schema: no valid_from / valid_until.
         await conn.execute(
@@ -106,7 +103,7 @@ async def test_postgres_migrates_store_missing_temporal_columns():
     await backend.save_node(_node_with_validity())
     loaded = await backend.load_node("n1")
 
-    async with pool.acquire() as conn:
+    async with pool.connection() as conn:
         await conn.execute(f"DROP TABLE IF EXISTS {prefix}edges CASCADE")
         await conn.execute(f"DROP TABLE IF EXISTS {prefix}nodes CASCADE")
     await pool.close()

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-28
+
+### Changed
+
+- **Breaking:** `PostgresBackend` uses psycopg 3 instead of asyncpg, and takes a `psycopg_pool.AsyncConnectionPool` where it took an `asyncpg.Pool`. The `postgres` extra installs `psycopg[binary]` and `psycopg-pool`. The reason is ProxySQL 3.0: it doesn't implement the protocol's Flush message, which asyncpg sends on every query, so every query failed behind it. psycopg sends Sync instead. The backend runs every statement unprepared and never uses `executemany()` or pipeline mode, which also send Flush.
+
+### Added
+
+- `PostgresBackend(..., create_schema=False)` for deployments whose application role can't run DDL. `init()` then creates nothing. It checks that both tables exist with every column and the configured embedding size, and raises naming what doesn't match.
+- `synap.backends.postgres.schema_sql(table_prefix, embedding_dim)` returns the DDL `init()` runs, for putting into a deployment's own migrations.
+
 ## [0.2.0] - 2026-09-17
 
 ### Changed

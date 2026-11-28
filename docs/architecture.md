@@ -164,7 +164,7 @@ This ensures all subsystems share the same graph instance.
 | `MemoryGraph` (default) | Python BFS | Python cosine | None | None |
 | `KuzuBackend` | Native Cypher variable-length paths | Native `array_cosine_similarity` | File-based | `kuzu` |
 | `SQLiteBackend` | Python BFS | Python cosine | File-based | `sqlite3` (stdlib) |
-| `PostgresBackend` | Recursive CTE | pgvector `<=>` cosine distance | Server-based | `asyncpg` |
+| `PostgresBackend` | Recursive CTE | pgvector `<=>` cosine distance | Server-based | `psycopg`, `psycopg-pool` |
 
 Kùzu is the recommended persistent backend — embedded (no server), native graph traversal via Cypher, and native vector similarity. Install with `pip install synap[kuzu]`.
 

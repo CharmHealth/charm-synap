@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "synap"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cognitive memory architecture for LLM agents"
 readme = "README.md"
 license = "MIT"
@@ -31,7 +31,8 @@ Changelog = "https://github.com/CharmHealth/charm-synap/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 kuzu = ["kuzu>=0.8.0"]
-postgres = ["asyncpg>=0.30.0"]
+# psycopg, not asyncpg: ProxySQL 3.0 rejects asyncpg's protocol (backends/postgres.py).
+postgres = ["psycopg[binary]>=3.2.10", "psycopg-pool>=3.2.6"]
 mcp = ["fastmcp>=2.0.0"]
 fastapi = ["fastapi>=0.115.0", "pydantic>=2.0", "uvicorn>=0.30.0"]
 # tracerite 2.6.0 renamed the module-level `style` that sanic reads as
@@ -42,7 +43,8 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "kuzu>=0.8.0",
-    "asyncpg>=0.30.0",
+    "psycopg[binary]>=3.2.10",
+    "psycopg-pool>=3.2.6",
     "httpx>=0.27",
     "sanic-testing>=24.6.0",
     "ruff>=0.6",
@@ -74,13 +76,13 @@ ignore = ["E501"]
 # Atomicity tests assert that *any* failure rolls back; the exception type is
 # secondary and varies by backend.
 "tests/test_episode_atomicity.py" = ["B017"]
-# Postgres tests import asyncpg conditionally after a DSN/skip guard (E402), and
+# Postgres tests import the psycopg helper after an importorskip guard (E402), and
 # assert a broad failure on the write path (B017).
 "tests/test_postgres.py" = ["B017", "E402"]
 
 [tool.mypy]
 python_version = "3.11"
-# Third-party deps without stubs (asyncpg, fastmcp, kuzu) — don't fail on them.
+# Third-party deps without stubs (fastmcp, kuzu) — don't fail on them.
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
