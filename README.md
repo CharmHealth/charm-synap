@@ -183,15 +183,18 @@ pip install synap[postgres]
 ```
 
 ```python
-import asyncpg
+from psycopg_pool import AsyncConnectionPool
 from synap.backends.postgres import PostgresBackend
 from synap.persistent_graph import PersistentGraph
 
-pool = await asyncpg.create_pool("postgresql://localhost:5432/mydb")
+pool = AsyncConnectionPool("postgresql://localhost:5432/mydb", open=False)
+await pool.open()
 backend = PostgresBackend(pool, embedding_dim=768)
 await backend.init()  # Creates tables (idempotent)
 graph = PersistentGraph(backend=backend)
 ```
+
+The backend uses psycopg 3, so it also runs behind ProxySQL 3.0, which rejects asyncpg's protocol. If your application role can't run DDL, create the tables in your own migrations from `synap.backends.postgres.schema_sql(prefix, dim)` and pass `create_schema=False`. Then `init()` creates nothing; it checks that the tables, their columns and the embedding size match, and refuses to start otherwise.
 
 | Backend | Graph traversal | Vector search | Persistence | Concurrency |
 |---|---|---|---|---|

@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
-import asyncpg
+from psycopg import AsyncCursor, errors
+from psycopg.rows import DictRow, dict_row
+from psycopg_pool import AsyncConnectionPool
 
 
 def _now_iso() -> str:
@@ -14,12 +18,13 @@ def _now_iso() -> str:
 
 
 def _coerce_timestamp(value: Any) -> datetime:
-    """Coerce a caller-supplied timestamp into a datetime asyncpg can encode.
+    """Coerce a caller-supplied timestamp into a timezone-aware datetime.
 
     Synap's higher layers serialize timestamps as ISO strings so they round-trip
-    through any backend, but asyncpg's timestamptz encoder requires a datetime
-    instance regardless of the ``::timestamptz`` cast on the bind. This adapter
-    accepts a datetime, an ISO 8601 string, or ``None`` (now)."""
+    through any backend. Binding a datetime rather than the string keeps a naive
+    ISO string from being read in the server session's time zone: it is pinned
+    to UTC here. This adapter accepts a datetime, an ISO 8601 string, or
+    ``None`` (now)."""
     if isinstance(value, datetime):
         return value
     if isinstance(value, str):
@@ -50,7 +55,7 @@ _EXTENSION_SQL = "CREATE EXTENSION IF NOT EXISTS vector;"
 # pgvector's hnsw index accepts at most 2000 dimensions for the `vector` type.
 # Checked at construction rather than at index-creation time because otherwise
 # the failure lands a long way from its cause: a 3072-dimension model (OpenAI's
-# text-embedding-3-large, for one) would get a raw asyncpg error out of init()
+# text-embedding-3-large, for one) would get a raw driver error out of init()
 # and the backend would never start, with nothing naming the dimension as the
 # problem.
 #
@@ -118,25 +123,69 @@ CREATE INDEX IF NOT EXISTS idx_{prefix}edges_type ON {prefix}edges(relation_type
 """
 
 
+# Columns init() checks for when create_schema=False. Kept next to _SCHEMA_SQL so
+# a column added there is added here too; a store missing one fails at startup
+# with the column named, not on the first query that touches it.
+_NODE_COLUMNS = frozenset({
+    "id", "node_type", "content", "embedding", "utility_score", "access_count",
+    "created_at", "last_accessed", "metadata", "valid_from", "valid_until",
+})
+_EDGE_COLUMNS = frozenset({
+    "id", "source_id", "target_id", "relation_type", "weight", "created_at",
+    "metadata",
+})
+
+
+def schema_sql(table_prefix: str = "synap_", embedding_dim: int = 1536) -> str:
+    """The DDL ``init()`` runs when ``create_schema=True``.
+
+    For deployments where the application role may not run DDL: put this in
+    the schema migrations (Flyway, Alembic, ...), run as a role that may, and
+    construct the backend with ``create_schema=False``. Does not include
+    ``CREATE EXTENSION vector``, which needs a superuser on managed Postgres.
+    """
+    return _SCHEMA_SQL.format(prefix=table_prefix, dim=embedding_dim)
+
+
 class PostgresBackend:
     """Async storage backend using PostgreSQL + pgvector.
 
     Designed for multi-process deployments (web servers, worker pools)
     where embedded databases like Kuzu or SQLite can't safely share state.
-    Uses asyncpg for native async I/O and pgvector for vector similarity.
+    Uses psycopg 3 (libpq) for async I/O and pgvector for vector similarity.
 
     Usage:
-        pool = await asyncpg.create_pool(dsn)
+        pool = AsyncConnectionPool(dsn, open=False)
+        await pool.open()
         backend = PostgresBackend(pool, embedding_dim=768)
         await backend.init()
         graph = PersistentGraph(backend=backend)
+
+    The pool may be shared with the rest of the application, whatever its
+    settings: every query here asks for dict rows on its own cursor and runs
+    unprepared, and writes are committed whether or not the pool's
+    connections are in autocommit mode.
+
+    Why psycopg and not asyncpg: some Postgres proxies, ProxySQL 3.0 among
+    them, don't implement the extended protocol's Flush message, which asyncpg
+    sends on every query. libpq sends Sync instead. For the same reason this
+    backend never uses ``executemany()`` or pipeline mode, both of which send
+    Flush. Statements are never prepared because a proxy that shares backend
+    connections may run the next query where the prepared statement doesn't
+    exist.
+
+    ``create_schema=False`` is for deployments where the application role
+    can't run DDL: the tables come from the deployment's own migrations (see
+    :func:`schema_sql`), and ``init()`` only checks that they are there, with
+    the columns and the embedding dimension this backend expects.
     """
 
     def __init__(
         self,
-        pool: asyncpg.Pool,
+        pool: AsyncConnectionPool,
         embedding_dim: int = 1536,
         table_prefix: str = "synap_",
+        create_schema: bool = True,
     ) -> None:
         if embedding_dim > HNSW_MAX_DIM:
             raise ValueError(
@@ -148,15 +197,38 @@ class PostgresBackend:
         self._pool = pool
         self._dim = embedding_dim
         self._prefix = table_prefix
+        self._create_schema = create_schema
         self._nodes = f"{table_prefix}nodes"
         self._edges = f"{table_prefix}edges"
 
+    @asynccontextmanager
+    async def _cursor(self) -> AsyncIterator[AsyncCursor[DictRow]]:
+        """A dict-row cursor on a pooled connection, for one operation."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                yield cur
+
+    @asynccontextmanager
+    async def _transaction(self) -> AsyncIterator[AsyncCursor[DictRow]]:
+        """Like ``_cursor``, inside one transaction (rolled back on error)."""
+        async with self._pool.connection() as conn, conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                yield cur
+
     async def init(self) -> None:
-        """Create tables and indexes. Idempotent — safe to call on every startup."""
-        async with self._pool.acquire() as conn:
+        """Create the tables and indexes, or check them when create_schema=False.
+
+        Idempotent — safe to call on every startup."""
+        if self._create_schema:
+            await self._create()
+        else:
+            await self._check_schema()
+
+    async def _create(self) -> None:
+        async with self._cursor() as cur:
             try:
-                await conn.execute(_EXTENSION_SQL)
-            except asyncpg.InsufficientPrivilegeError as exc:
+                await cur.execute(_EXTENSION_SQL, prepare=False)
+            except errors.InsufficientPrivilege as exc:
                 # Verified against Postgres 14: a non-superuser running
                 # `CREATE EXTENSION IF NOT EXISTS vector` SUCCEEDS when the
                 # extension is already installed (NOTICE, skipping) and fails
@@ -171,7 +243,7 @@ class PostgresBackend:
                     "role with rds_superuser. The application role needs no "
                     "extension privileges once it exists."
                 ) from exc
-            except asyncpg.UndefinedFileError as exc:
+            except errors.UndefinedFile as exc:
                 # 58P01. Distinct from the privilege case above and much more
                 # common: the extension's control file is not on the server at
                 # all, so no role can create it and the advice to find an
@@ -185,10 +257,12 @@ class PostgresBackend:
                     "image that ships it: pgvector/pgvector, or RDS/Aurora."
                 ) from exc
             try:
-                await conn.execute(
-                    _SCHEMA_SQL.format(prefix=self._prefix, dim=self._dim)
+                # No parameters, so psycopg sends this as one simple query and
+                # the several statements in it run together.
+                await cur.execute(
+                    schema_sql(self._prefix, self._dim), prepare=False
                 )
-            except asyncpg.UndefinedObjectError as exc:
+            except errors.UndefinedObject as exc:
                 # 42704. In this statement the only object that can be
                 # undefined is the hnsw access method: the `vector` type itself
                 # would have failed at CREATE EXTENSION above, and everything
@@ -202,20 +276,62 @@ class PostgresBackend:
                     "the newest available."
                 ) from exc
 
+    async def _check_schema(self) -> None:
+        """Refuse to start against tables that aren't the ones this backend uses."""
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT c.relname AS table_name, a.attname AS column_name,
+                       format_type(a.atttypid, a.atttypmod) AS column_type
+                FROM pg_attribute a
+                JOIN pg_class c ON c.oid = a.attrelid
+                WHERE a.attrelid IN (to_regclass(%(nodes)s), to_regclass(%(edges)s))
+                  AND a.attnum > 0 AND NOT a.attisdropped
+                """,
+                {"nodes": self._nodes, "edges": self._edges},
+                prepare=False,
+            )
+            rows = await cur.fetchall()
+        columns: dict[str, dict[str, str]] = {self._nodes: {}, self._edges: {}}
+        for row in rows:
+            columns[row["table_name"]][row["column_name"]] = row["column_type"]
+
+        problems = []
+        for table, expected in ((self._nodes, _NODE_COLUMNS), (self._edges, _EDGE_COLUMNS)):
+            if not columns[table]:
+                problems.append(f"table {table} does not exist")
+                continue
+            missing = sorted(expected - columns[table].keys())
+            if missing:
+                problems.append(f"{table} has no column {', '.join(missing)}")
+        embedding_type = columns[self._nodes].get("embedding")
+        if embedding_type and embedding_type != f"vector({self._dim})":
+            problems.append(
+                f"{self._nodes}.embedding is {embedding_type}, but this backend "
+                f"was configured with embedding_dim={self._dim}"
+            )
+        if problems:
+            raise RuntimeError(
+                "synap's Postgres tables don't match this backend (create_schema="
+                "False, so they must come from the deployment's migrations; "
+                "synap.backends.postgres.schema_sql() gives the DDL): "
+                + "; ".join(problems)
+            )
+
     # --- Node operations ---
 
-    async def _write_node(self, conn: asyncpg.Connection, node: dict[str, Any]) -> None:
-        """Upsert one node on the given connection (for save_node and batches)."""
+    async def _write_node(self, cur: AsyncCursor[DictRow], node: dict[str, Any]) -> None:
+        """Upsert one node with the given cursor (for save_node and batches)."""
         embedding = node.get("embedding")
         embedding_str = _format_vector(embedding) if embedding else None
-        await conn.execute(
+        await cur.execute(
             f"""
             INSERT INTO {self._nodes}
                 (id, node_type, content, embedding, utility_score,
                  access_count, created_at, last_accessed, metadata,
                  valid_from, valid_until)
-            VALUES ($1, $2, $3, $4::vector, $5, $6, $7::timestamptz, $8::timestamptz, $9::jsonb,
-                    $10::timestamptz, $11::timestamptz)
+            VALUES (%s, %s, %s, %s::vector, %s, %s, %s::timestamptz, %s::timestamptz, %s::jsonb,
+                    %s::timestamptz, %s::timestamptz)
             ON CONFLICT (id) DO UPDATE SET
                 node_type = EXCLUDED.node_type,
                 content = EXCLUDED.content,
@@ -227,101 +343,116 @@ class PostgresBackend:
                 valid_from = EXCLUDED.valid_from,
                 valid_until = EXCLUDED.valid_until
             """,
-            node["id"],
-            node["node_type"],
-            node["content"],
-            embedding_str,
-            float(node.get("utility_score", 1.0)),
-            int(node.get("access_count", 0)),
-            _coerce_timestamp(node.get("created_at")),
-            _coerce_timestamp(node.get("last_accessed")),
-            json.dumps(node.get("metadata", {})),
-            _coerce_timestamp_optional(node.get("valid_from")),
-            _coerce_timestamp_optional(node.get("valid_until")),
+            (
+                node["id"],
+                node["node_type"],
+                node["content"],
+                embedding_str,
+                float(node.get("utility_score", 1.0)),
+                int(node.get("access_count", 0)),
+                _coerce_timestamp(node.get("created_at")),
+                _coerce_timestamp(node.get("last_accessed")),
+                json.dumps(node.get("metadata", {})),
+                _coerce_timestamp_optional(node.get("valid_from")),
+                _coerce_timestamp_optional(node.get("valid_until")),
+            ),
+            prepare=False,
         )
 
     async def save_node(self, node: dict[str, Any]) -> None:
-        async with self._pool.acquire() as conn:
-            await self._write_node(conn, node)
+        async with self._transaction() as cur:
+            await self._write_node(cur, node)
 
     async def load_node(self, node_id: str) -> dict[str, Any] | None:
-        async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
+        async with self._cursor() as cur:
+            await cur.execute(
                 f"""
-                SELECT id, node_type, content, embedding::text,
+                SELECT id, node_type, content, embedding::text AS embedding,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata,
-                       valid_from::text, valid_until::text
-                FROM {self._nodes} WHERE id = $1
+                       created_at::text AS created_at,
+                       last_accessed::text AS last_accessed, metadata,
+                       valid_from::text AS valid_from,
+                       valid_until::text AS valid_until
+                FROM {self._nodes} WHERE id = %s
                 """,
-                node_id,
+                (node_id,),
+                prepare=False,
             )
+            row = await cur.fetchone()
         if row is None:
             return None
         return _row_to_node(row)
 
     # --- Edge operations ---
 
-    async def _write_edge(self, conn: asyncpg.Connection, edge: dict[str, Any]) -> None:
-        """Upsert one edge on the given connection (for save_edge and batches)."""
-        await conn.execute(
+    async def _write_edge(self, cur: AsyncCursor[DictRow], edge: dict[str, Any]) -> None:
+        """Upsert one edge with the given cursor (for save_edge and batches)."""
+        await cur.execute(
             f"""
             INSERT INTO {self._edges}
                 (id, source_id, target_id, relation_type, weight, created_at, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s::timestamptz, %s::jsonb)
             ON CONFLICT (id) DO UPDATE SET
                 relation_type = EXCLUDED.relation_type,
                 weight = EXCLUDED.weight,
                 metadata = EXCLUDED.metadata
             """,
-            edge["id"],
-            edge["source_id"],
-            edge["target_id"],
-            edge["relation_type"],
-            float(edge.get("weight", 1.0)),
-            _coerce_timestamp(edge.get("created_at")),
-            json.dumps(edge.get("metadata", {})),
+            (
+                edge["id"],
+                edge["source_id"],
+                edge["target_id"],
+                edge["relation_type"],
+                float(edge.get("weight", 1.0)),
+                _coerce_timestamp(edge.get("created_at")),
+                json.dumps(edge.get("metadata", {})),
+            ),
+            prepare=False,
         )
 
     async def save_edge(self, edge: dict[str, Any]) -> None:
-        async with self._pool.acquire() as conn:
-            await self._write_edge(conn, edge)
+        async with self._transaction() as cur:
+            await self._write_edge(cur, edge)
 
     async def write_batch(
         self, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
     ) -> None:
-        """Write nodes then edges atomically in one transaction; rolls back on error."""
-        async with self._pool.acquire() as conn:
-            async with conn.transaction():
-                for node in nodes:
-                    await self._write_node(conn, node)
-                for edge in edges:
-                    await self._write_edge(conn, edge)
+        """Write nodes then edges atomically in one transaction; rolls back on error.
+
+        One statement per row, not executemany(): see the class docstring."""
+        async with self._transaction() as cur:
+            for node in nodes:
+                await self._write_node(cur, node)
+            for edge in edges:
+                await self._write_edge(cur, edge)
 
     async def load_edges(
         self, node_id: str, edge_type: str | None = None
     ) -> list[dict[str, Any]]:
-        async with self._pool.acquire() as conn:
+        async with self._cursor() as cur:
             if edge_type:
-                rows = await conn.fetch(
+                await cur.execute(
                     f"""
                     SELECT id, source_id, target_id, relation_type, weight,
-                           created_at::text, metadata
+                           created_at::text AS created_at, metadata
                     FROM {self._edges}
-                    WHERE (source_id = $1 OR target_id = $1) AND relation_type = $2
+                    WHERE (source_id = %(node_id)s OR target_id = %(node_id)s)
+                      AND relation_type = %(edge_type)s
                     """,
-                    node_id, edge_type,
+                    {"node_id": node_id, "edge_type": edge_type},
+                    prepare=False,
                 )
             else:
-                rows = await conn.fetch(
+                await cur.execute(
                     f"""
                     SELECT id, source_id, target_id, relation_type, weight,
-                           created_at::text, metadata
+                           created_at::text AS created_at, metadata
                     FROM {self._edges}
-                    WHERE source_id = $1 OR target_id = $1
+                    WHERE source_id = %(node_id)s OR target_id = %(node_id)s
                     """,
-                    node_id,
+                    {"node_id": node_id},
+                    prepare=False,
                 )
+            rows = await cur.fetchall()
         return [_row_to_edge(r) for r in rows]
 
     # --- Query ---
@@ -333,72 +464,79 @@ class PostgresBackend:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         conditions = ["1=1"]
-        params: list[Any] = []
-        idx = 1
+        params: dict[str, Any] = {"limit": limit}
 
         if node_type:
-            conditions.append(f"node_type = ${idx}")
-            params.append(node_type)
-            idx += 1
+            conditions.append("node_type = %(node_type)s")
+            params["node_type"] = node_type
 
         if filters:
-            conditions.append(f"metadata @> ${idx}::jsonb")
-            params.append(json.dumps(filters))
-            idx += 1
+            conditions.append("metadata @> %(filters)s::jsonb")
+            params["filters"] = json.dumps(filters)
 
-        conditions.append(f"LIMIT ${idx}")
-        params.append(limit)
+        where = " AND ".join(conditions)
 
-        where = " AND ".join(conditions[:-1])
-        limit_clause = conditions[-1]
-
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
+        async with self._cursor() as cur:
+            await cur.execute(
                 f"""
-                SELECT id, node_type, content, embedding::text,
+                SELECT id, node_type, content, embedding::text AS embedding,
                        utility_score, access_count,
-                       created_at::text, last_accessed::text, metadata,
-                       valid_from::text, valid_until::text
+                       created_at::text AS created_at,
+                       last_accessed::text AS last_accessed, metadata,
+                       valid_from::text AS valid_from,
+                       valid_until::text AS valid_until
                 FROM {self._nodes}
                 WHERE {where}
                 ORDER BY utility_score DESC
-                {limit_clause}
+                LIMIT %(limit)s
                 """,
-                *params,
+                params,
+                prepare=False,
             )
+            rows = await cur.fetchall()
         return [_row_to_node(r) for r in rows]
 
     # --- Counts ---
 
     async def node_count(self, node_type: str | None = None) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._cursor() as cur:
             if node_type:
-                row = await conn.fetchrow(
-                    f"SELECT count(*) FROM {self._nodes} WHERE node_type = $1",
-                    node_type,
+                await cur.execute(
+                    f"SELECT count(*) AS n FROM {self._nodes} WHERE node_type = %s",
+                    (node_type,),
+                    prepare=False,
                 )
             else:
-                row = await conn.fetchrow(f"SELECT count(*) FROM {self._nodes}")
-        return row[0]
+                await cur.execute(
+                    f"SELECT count(*) AS n FROM {self._nodes}", prepare=False
+                )
+            row = await cur.fetchone()
+        assert row is not None  # count(*) always returns one row
+        return int(row["n"])
 
     async def edge_count(self, relation_type: str | None = None) -> int:
-        async with self._pool.acquire() as conn:
+        async with self._cursor() as cur:
             if relation_type:
-                row = await conn.fetchrow(
-                    f"SELECT count(*) FROM {self._edges} WHERE relation_type = $1",
-                    relation_type,
+                await cur.execute(
+                    f"SELECT count(*) AS n FROM {self._edges} WHERE relation_type = %s",
+                    (relation_type,),
+                    prepare=False,
                 )
             else:
-                row = await conn.fetchrow(f"SELECT count(*) FROM {self._edges}")
-        return row[0]
+                await cur.execute(
+                    f"SELECT count(*) AS n FROM {self._edges}", prepare=False
+                )
+            row = await cur.fetchone()
+        assert row is not None  # count(*) always returns one row
+        return int(row["n"])
 
     # --- Delete ---
 
     async def delete_node(self, node_id: str) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._transaction() as cur:
             # Edges deleted by ON DELETE CASCADE
-            await conn.execute(
-                f"DELETE FROM {self._nodes} WHERE id = $1", node_id
+            await cur.execute(
+                f"DELETE FROM {self._nodes} WHERE id = %s", (node_id,), prepare=False
             )
 
     async def delete_nodes_batch(self, node_ids: list[str]) -> None:
@@ -408,15 +546,17 @@ class PostgresBackend:
         """
         if not node_ids:
             return
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"DELETE FROM {self._nodes} WHERE id = ANY($1::text[])", node_ids
+        async with self._transaction() as cur:
+            await cur.execute(
+                f"DELETE FROM {self._nodes} WHERE id = ANY(%s::text[])",
+                (list(node_ids),),
+                prepare=False,
             )
 
     async def delete_edge(self, edge_id: str) -> None:
-        async with self._pool.acquire() as conn:
-            await conn.execute(
-                f"DELETE FROM {self._edges} WHERE id = $1", edge_id
+        async with self._transaction() as cur:
+            await cur.execute(
+                f"DELETE FROM {self._edges} WHERE id = %s", (edge_id,), prepare=False
             )
 
     # --- Vector similarity search ---
@@ -427,38 +567,30 @@ class PostgresBackend:
         node_type: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        vec_str = _format_vector(embedding)
-        async with self._pool.acquire() as conn:
-            if node_type:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT id, node_type, content, embedding::text,
-                           utility_score, access_count,
-                           created_at::text, last_accessed::text, metadata,
-                           valid_from::text, valid_until::text,
-                           1 - (embedding <=> $1::vector) AS similarity
-                    FROM {self._nodes}
-                    WHERE node_type = $2 AND embedding IS NOT NULL
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $3
-                    """,
-                    vec_str, node_type, limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    f"""
-                    SELECT id, node_type, content, embedding::text,
-                           utility_score, access_count,
-                           created_at::text, last_accessed::text, metadata,
-                           valid_from::text, valid_until::text,
-                           1 - (embedding <=> $1::vector) AS similarity
-                    FROM {self._nodes}
-                    WHERE embedding IS NOT NULL
-                    ORDER BY embedding <=> $1::vector
-                    LIMIT $2
-                    """,
-                    vec_str, limit,
-                )
+        params: dict[str, Any] = {"vec": _format_vector(embedding), "limit": limit}
+        type_filter = ""
+        if node_type:
+            type_filter = "node_type = %(node_type)s AND"
+            params["node_type"] = node_type
+        async with self._cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT id, node_type, content, embedding::text AS embedding,
+                       utility_score, access_count,
+                       created_at::text AS created_at,
+                       last_accessed::text AS last_accessed, metadata,
+                       valid_from::text AS valid_from,
+                       valid_until::text AS valid_until,
+                       1 - (embedding <=> %(vec)s::vector) AS similarity
+                FROM {self._nodes}
+                WHERE {type_filter} embedding IS NOT NULL
+                ORDER BY embedding <=> %(vec)s::vector
+                LIMIT %(limit)s
+                """,
+                params,
+                prepare=False,
+            )
+            rows = await cur.fetchall()
         return [_row_to_node(r) for r in rows]
 
     # --- Graph traversal via recursive CTE ---
@@ -471,24 +603,26 @@ class PostgresBackend:
         max_nodes: int = 50,
     ) -> list[dict[str, Any]]:
         type_filter = ""
-        params: list[Any] = [start_id, max_depth, max_nodes]
+        params: dict[str, Any] = {
+            "start": start_id, "max_depth": max_depth, "max_nodes": max_nodes,
+        }
 
         if edge_types:
-            type_filter = "AND e.relation_type = ANY($4)"
-            params.append(edge_types)
+            type_filter = "AND e.relation_type = ANY(%(edge_types)s::text[])"
+            params["edge_types"] = list(edge_types)
 
-        async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
+        async with self._cursor() as cur:
+            await cur.execute(
                 f"""
                 WITH RECURSIVE traversal AS (
                     SELECT
-                        CASE WHEN e.source_id = $1 THEN e.target_id
+                        CASE WHEN e.source_id = %(start)s THEN e.target_id
                              ELSE e.source_id END AS node_id,
                         1 AS depth,
-                        ARRAY[CASE WHEN e.source_id = $1 THEN e.target_id
+                        ARRAY[CASE WHEN e.source_id = %(start)s THEN e.target_id
                                    ELSE e.source_id END] AS path
                     FROM {self._edges} e
-                    WHERE (e.source_id = $1 OR e.target_id = $1)
+                    WHERE (e.source_id = %(start)s OR e.target_id = %(start)s)
                         {type_filter}
 
                     UNION ALL
@@ -502,24 +636,28 @@ class PostgresBackend:
                     FROM traversal t
                     JOIN {self._edges} e
                         ON (e.source_id = t.node_id OR e.target_id = t.node_id)
-                    WHERE t.depth < $2
+                    WHERE t.depth < %(max_depth)s
                         AND CASE WHEN e.source_id = t.node_id THEN e.target_id
                                  ELSE e.source_id END <> ALL(t.path)
                         AND CASE WHEN e.source_id = t.node_id THEN e.target_id
-                                 ELSE e.source_id END <> $1
+                                 ELSE e.source_id END <> %(start)s
                         {type_filter}
                 )
                 SELECT DISTINCT ON (n.id)
-                    n.id, n.node_type, n.content, n.embedding::text,
+                    n.id, n.node_type, n.content, n.embedding::text AS embedding,
                     n.utility_score, n.access_count,
-                    n.created_at::text, n.last_accessed::text, n.metadata,
-                    n.valid_from::text, n.valid_until::text
+                    n.created_at::text AS created_at,
+                    n.last_accessed::text AS last_accessed, n.metadata,
+                    n.valid_from::text AS valid_from,
+                    n.valid_until::text AS valid_until
                 FROM traversal t
                 JOIN {self._nodes} n ON n.id = t.node_id
-                LIMIT $3
+                LIMIT %(max_nodes)s
                 """,
-                *params,
+                params,
+                prepare=False,
             )
+            rows = await cur.fetchall()
         return [_row_to_node(r) for r in rows]
 
     async def close(self) -> None:
@@ -542,7 +680,7 @@ def _parse_vector(val: str | None) -> list[float] | None:
     return [float(x) for x in val.strip("[]").split(",") if x.strip()]
 
 
-def _row_to_node(row: asyncpg.Record) -> dict[str, Any]:
+def _row_to_node(row: dict[str, Any]) -> dict[str, Any]:
     meta = row["metadata"]
     if isinstance(meta, str):
         meta = json.loads(meta)
@@ -550,18 +688,18 @@ def _row_to_node(row: asyncpg.Record) -> dict[str, Any]:
         "id": row["id"],
         "node_type": row["node_type"],
         "content": row["content"],
-        "embedding": _parse_vector(row["embedding"]) if "embedding" in row.keys() else None,
+        "embedding": _parse_vector(row.get("embedding")),
         "utility_score": row["utility_score"],
         "access_count": row["access_count"],
         "created_at": row["created_at"],
         "last_accessed": row["last_accessed"],
         "metadata": meta if isinstance(meta, dict) else {},
-        "valid_from": row["valid_from"] if "valid_from" in row.keys() else None,
-        "valid_until": row["valid_until"] if "valid_until" in row.keys() else None,
+        "valid_from": row.get("valid_from"),
+        "valid_until": row.get("valid_until"),
     }
 
 
-def _row_to_edge(row: asyncpg.Record) -> dict[str, Any]:
+def _row_to_edge(row: dict[str, Any]) -> dict[str, Any]:
     meta = row["metadata"]
     if isinstance(meta, str):
         meta = json.loads(meta)

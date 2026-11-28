@@ -18,9 +18,10 @@ import os
 
 import pytest
 
-asyncpg = pytest.importorskip("asyncpg")
+pytest.importorskip("psycopg_pool")
 
 from synap.backends.postgres import PostgresBackend
+from tests.pg_pool import open_pool  # noqa: E402
 
 DSN = os.environ.get("SYNAP_TEST_POSTGRES_DSN")
 
@@ -70,13 +71,13 @@ def _prefix(request) -> str:
 @pytest.fixture
 async def db(request):
     prefix = _prefix(request)
-    pool = await asyncpg.create_pool(DSN, min_size=1, max_size=5)
+    pool = await open_pool(DSN)
     backend = PostgresBackend(pool, embedding_dim=3, table_prefix=prefix)
     await backend.init()
     try:
         yield backend
     finally:
-        async with pool.acquire() as conn:
+        async with pool.connection() as conn:
             await conn.execute(f"DROP TABLE IF EXISTS {prefix}edges CASCADE")
             await conn.execute(f"DROP TABLE IF EXISTS {prefix}nodes CASCADE")
         await pool.close()
@@ -421,12 +422,14 @@ async def test_init_creates_an_hnsw_index_on_the_embedding(db: PostgresBackend):
     # Looked up by definition rather than by name: Postgres truncates
     # identifiers at 63 bytes, and this suite's per-test table prefix is long
     # enough to clip the tail off the intended name.
-    async with db._pool.acquire() as conn:
-        definition = await conn.fetchval(
+    async with db._pool.connection() as conn:
+        cur = await conn.execute(
             "SELECT indexdef FROM pg_indexes "
-            "WHERE tablename = $1 AND indexdef LIKE '%(embedding%'",
-            f"{db._prefix}nodes",
+            "WHERE tablename = %s AND indexdef LIKE '%%(embedding%%'",
+            (f"{db._prefix}nodes",),
         )
+        found = await cur.fetchone()
+    definition = found[0] if found else None
     assert definition is not None, "no index was created on the embedding column"
     assert "USING hnsw" in definition, definition
     # vector_cosine_ops, because search_similar orders by <=>. An l2 index looks
@@ -444,14 +447,15 @@ async def test_the_planner_uses_that_index_for_the_search_query(db: PostgresBack
     in the plan, a mismatched one leaves a Seq Scan behind.
     """
     await db.save_node(_make_node("n1", embedding=[1.0, 0.0, 0.0]))
-    async with db._pool.acquire() as conn:
+    async with db._pool.connection() as conn:
         async with conn.transaction():
             await conn.execute("SET LOCAL enable_seqscan = off")
-            rows = await conn.fetch(
+            cur = await conn.execute(
                 f"EXPLAIN SELECT id FROM {db._prefix}nodes "
                 f"ORDER BY embedding <=> '[1,0,0]'::vector LIMIT 5"
             )
-    plan = "\n".join(r["QUERY PLAN"] for r in rows)
+            rows = await cur.fetchall()
+    plan = "\n".join(r[0] for r in rows)
     # Not asserted by index name — see the note in the test above.
     assert "Index Scan" in plan, plan
     assert "embedding <=>" in plan, plan

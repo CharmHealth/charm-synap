@@ -21,11 +21,8 @@ import pytest
 from synap.backends.kuzu import KuzuBackend
 from synap.backends.postgres import PostgresBackend
 from synap.backends.sqlite import SQLiteBackend
-
-try:
-    import asyncpg
-except ImportError:  # pragma: no cover
-    asyncpg = None
+from tests.pg_pool import AVAILABLE as PG_AVAILABLE
+from tests.pg_pool import open_pool
 
 DSN = os.environ.get("SYNAP_TEST_POSTGRES_DSN")
 
@@ -69,16 +66,16 @@ async def backend(request, tmp_path):
         finally:
             b.close()
     else:
-        if asyncpg is None or not DSN:
-            pytest.skip("set SYNAP_TEST_POSTGRES_DSN (with asyncpg) for Postgres")
+        if not PG_AVAILABLE or not DSN:
+            pytest.skip("set SYNAP_TEST_POSTGRES_DSN (with psycopg) for Postgres")
         prefix = f"tmp_{uuid.uuid4().hex[:12]}_"
-        pool = await asyncpg.create_pool(DSN, min_size=1, max_size=5)
+        pool = await open_pool(DSN)
         b = PostgresBackend(pool, embedding_dim=3, table_prefix=prefix)
         await b.init()
         try:
             yield b
         finally:
-            async with pool.acquire() as conn:
+            async with pool.connection() as conn:
                 await conn.execute(f"DROP TABLE IF EXISTS {prefix}edges CASCADE")
                 await conn.execute(f"DROP TABLE IF EXISTS {prefix}nodes CASCADE")
             await pool.close()
