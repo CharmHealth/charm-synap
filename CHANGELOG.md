@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-28
+
 ### Changed
 
 - **Breaking:** `PostgresBackend` uses psycopg 3 instead of asyncpg, and takes a `psycopg_pool.AsyncConnectionPool` where it took an `asyncpg.Pool`. The `postgres` extra installs `psycopg[binary]` and `psycopg-pool`. The reason is ProxySQL 3.0: it doesn't implement the protocol's Flush message, which asyncpg sends on every query, so every query failed behind it. psycopg sends Sync instead. The backend runs every statement unprepared and never uses `executemany()` or pipeline mode, which also send Flush.
