@@ -85,7 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_type ON {prefix}nodes(node_type);
 CREATE INDEX IF NOT EXISTS idx_{prefix}nodes_utility ON {prefix}nodes(utility_score);
 
 -- The index the similarity search actually needs. search_similar orders by
--- `embedding <=> $1::vector` (cosine distance), and without an index for that
+-- `embedding <=> <query vector>` (cosine distance), and without an index for that
 -- operator every search is a sequential scan computing a distance for every
 -- node in the graph — which is exactly the query the graph exists to serve.
 --
